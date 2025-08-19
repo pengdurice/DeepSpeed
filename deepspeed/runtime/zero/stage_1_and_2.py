@@ -29,7 +29,7 @@ from deepspeed.git_version_info import version
 
 from deepspeed.runtime.constants import PIPE_REPLICATED
 from deepspeed.accelerator import get_accelerator
-
+from muon import muon_update
 from deepspeed.checkpoint.constants import (DS_VERSION, GROUP_PADDINGS, PARTITION_COUNT, LOSS_SCALER,
                                             SINGLE_PARTITION_OF_FP32_GROUPS, BASE_OPTIMIZER_STATE,
                                             BASE_OPTIMIZER_STATE_STEP, CLIP_GRAD, ZERO_STAGE, PARAM_SLICE_MAPPINGS)
@@ -1842,20 +1842,34 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         return total_norm
 
-    # creates a flat fused tensor from the tensor list starting at the first_offset
-    # in the first tensor of the list. If there are not enough elements in the tensor
-    # list then the flat tensor will be padded with zeros
-    def get_flat_partition(self, tensor_list, first_offset, partition_size, dtype, device, return_tensor_list=False):
+    def get_flat_partition(self, tensor_list, first_offset, partition_size, dtype, device, param_group_idx, return_tensor_list=False):
         flat_tensor_list = []
         current_size = 0
-
+        # find the flatten copy in the optimizer's state
+        flatten_copy = self.optimizer.param_groups[param_group_idx]['params'][0]
+        if (not self.optimizer.state[flatten_copy]) and tensor_list[0].use_muon:
+            self.optimizer.state[flatten_copy] = {}
+        if "momentum_buffer" not in self.optimizer.state[flatten_copy] and tensor_list[0].use_muon:
+            # need to check the total # of elements in the parameters in this group and this partition
+            total_size = sum([t.numel() for t in tensor_list])
+            flatten_bf_list = [torch.zeros([total_size], dtype=dtype)] # put on cpu to save space
+            self.optimizer.state[flatten_copy]["momentum_buffer"] = self.flatten(flatten_bf_list)
+        
+        buffer_idx = 0
         for i, tensor in enumerate(tensor_list):
             grad_accum = self.get_param_gradient_attribute(tensor)
             if grad_accum is None:
                 grad_accum = torch.zeros_like(tensor, dtype=dtype)
-
+            if tensor.use_muon:
+                assert tensor.ndim > 1, f"if use muon, then tensor dim > 1, got {tensor.size()}"
+                # create a gpu copy
+                buffer = torch.narrow(self.optimizer.state[flatten_copy]["momentum_buffer"], 0, buffer_idx, tensor.numel()).view(tensor.size()).to(device).to(dtype)
+                grad_accum = muon_update(grad_accum, buffer, self.optimizer.param_groups[param_group_idx]['momentum'])
+                # write back to the cpu copy
+                torch.narrow(self.optimizer.state[flatten_copy]["momentum_buffer"], 0, buffer_idx, tensor.numel()).data.copy_(buffer.view(-1).data)
             tensor = grad_accum
             num_elements = tensor.numel()
+            buffer_idx += num_elements
             tensor_offset = 0
 
             # we need to offset to get to the right element
