@@ -1842,6 +1842,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         return total_norm
 
+    # creates a flat fused tensor from the tensor list starting at the first_offset
+    # in the first tensor of the list. If there are not enough elements in the tensor
+    # list then the flat tensor will be padded with zeros
     def get_flat_partition(self, tensor_list, first_offset, partition_size, dtype, device, param_group_idx, return_tensor_list=False):
         flat_tensor_list = []
         current_size = 0
@@ -1860,6 +1863,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             grad_accum = self.get_param_gradient_attribute(tensor)
             if grad_accum is None:
                 grad_accum = torch.zeros_like(tensor, dtype=dtype)
+
             if tensor.use_muon:
                 assert tensor.ndim > 1, f"if use muon, then tensor dim > 1, got {tensor.size()}"
                 # create a gpu copy
