@@ -853,6 +853,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         self.partition_size[i],
                         dtype=self.gradient_accumulation_dtype,
                         device=get_accelerator().current_device_name(),
+                        param_group_idx=i,
                         return_tensor_list=True)
                 else:
                     avg_new = self.get_flat_partition(self.params_in_partition[i],
@@ -860,6 +861,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                                                       self.partition_size[i],
                                                       dtype=self.gradient_accumulation_dtype,
                                                       device=get_accelerator().current_device_name(),
+                                                      param_group_idx=i,
                                                       return_tensor_list=True)
 
                     for accumulated_grad, new_avg_grad in zip(self.averaged_gradients[i], avg_new):

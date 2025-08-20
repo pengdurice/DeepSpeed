@@ -19,10 +19,11 @@ class MuonWithAuxAdam(BaseMuonWithAuxAdam):
                 loss = closure()
         for group in self.param_groups:
             if group["use_muon"]:
-               # we move the muon update part to the deepspeed's optimizer since the parameter here is a flat version
-               # thus not suitable for muon update
-               p.mul_(1 - group["lr"] * group["weight_decay"])
-               p.add_(p.grad.reshape(p.shape), alpha=-group["lr"])
+                # we move the muon update part to the deepspeed's optimizer since the parameter here is a flat version
+                # thus not suitable for muon update
+                for p in group["params"]:
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(p.grad.reshape(p.shape), alpha=-group["lr"])
             else:
                 for p in group["params"]:
                     if p.grad is None:
