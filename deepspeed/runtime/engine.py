@@ -1580,7 +1580,7 @@ class DeepSpeedEngine(Module):
             assert zero_stage <= ZeroStageEnum.gradients, "Muon optimizer is not yet compatible with ZeRO Stage 3"
             if not all([hasattr(p, 'use_muon') for p in model_parameters]):
                 msg = "Muon optimizer is used, but the use_muon attribute is NOT configured for some of the model parameters, " \
-                "please set by `param.use_muon = True` if you want to use Muon optimizer for that param"
+                "please set by `param.use_muon = True / False` for all params"
                 logger.error(msg)
             muon_params = [p for p in model_parameters if p.use_muon]
             non_muon_params = [p for p in model_parameters if not p.use_muon]

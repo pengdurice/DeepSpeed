@@ -64,7 +64,7 @@ class TestMuonConfigs(DistributedTest):
             dist_init_required=False,
         )
         steps = 5
-        for step in range(steps):
+        for _ in range(steps):
             # Random inputs: (batch_size, hidden_dim)
             x = torch.randn(batch_size, hidden_dim, device=engine.device, dtype=torch.half)
             # Random class labels: (batch_size,)
