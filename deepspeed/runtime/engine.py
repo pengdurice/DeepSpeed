@@ -1586,9 +1586,17 @@ class DeepSpeedEngine(Module):
             non_muon_params = [p for p in model_parameters if not p.use_muon]
             param_groups = []
             if muon_params:
-                param_groups.append(dict(params=muon_params, use_muon=True, **optimizer_parameters))
+                accepted_parameters = dict()
+                for key in ["lr", "momentum", "weight_decay"]:
+                    if key in optimizer_parameters:
+                        accepted_parameters[key] = optimizer_parameters[key]
+                param_groups.append(dict(params=muon_params, use_muon=True, **accepted_parameters))
             if non_muon_params:
-                param_groups.append(dict(params=non_muon_params, use_muon=False, **optimizer_parameters))
+                accepted_parameters = dict()
+                for key in ["lr", "betas", "eps", "weight_decay"]:
+                    if key in optimizer_parameters:
+                        accepted_parameters[key] = optimizer_parameters[key]
+                param_groups.append(dict(params=non_muon_params, use_muon=False, **accepted_parameters))
             optimizer = MuonWithAuxAdam(param_groups)
         else:
             torch_optimizer = getattr(torch.optim, self.optimizer_name())
