@@ -57,12 +57,13 @@ class TestMuonConfigs(DistributedTest):
         if 'muon' in optimizer_type:
             set_muon_flag(model.parameters())
         initial_params = [p.clone().cpu() for p in model.parameters()]
-        engine, _, _, _ = deepspeed.initialize(
+        engine, optimizer, _, _ = deepspeed.initialize(
             config=config_dict,
             model=model,
             model_parameters=model.parameters(),
             dist_init_required=False,
         )
+        assert optimizer_type in optimizer.optimizer.__class__.__name__.lower(), f"Expected optimizer type {optimizer_type}, got {optimizer.optimizer.__class__.__name__}"
         steps = 5
         for _ in range(steps):
             # Random inputs: (batch_size, hidden_dim)
