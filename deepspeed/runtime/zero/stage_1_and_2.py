@@ -558,7 +558,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         # will store the averaged gradients required by this partition
         self.averaged_gradients = {}
-
+        self.all_grad_tensors = {}
         # For cpu_offload, will store the averaged gradients required by this partition
         self.offload_gradient_dict = {}
 
@@ -845,8 +845,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         if self.cpu_offload is False:
             for i, _ in enumerate(self.bit16_groups):
-
-                if i not in self.averaged_gradients or self.averaged_gradients[i] is None:
+                if not i in self.averaged_gradients or self.averaged_gradients[i] is None:
+                    self.all_grad_tensors[i] = self.get_all_grad_tensors(self.params_in_partition[i], dtype=self.gradient_accumulation_dtype)
+                else:
+                    avg_new = self.get_all_grad_tensors(self.params_in_partition[i], dtype=self.gradient_accumulation_dtype)
+                    for accumulated_grad, new_avg_grad in zip(self.all_grad_tensors[i], avg_new):
+                        accumulated_grad.add_(new_avg_grad)
+                if self.is_gradient_accumulation_boundary:
                     self.averaged_gradients[i] = self.get_flat_partition(
                         self.params_in_partition[i],
                         self.first_offset[i],
@@ -855,17 +860,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         device=get_accelerator().current_device_name(),
                         param_group_idx=i,
                         return_tensor_list=True)
-                else:
-                    avg_new = self.get_flat_partition(self.params_in_partition[i],
-                                                      self.first_offset[i],
-                                                      self.partition_size[i],
-                                                      dtype=self.gradient_accumulation_dtype,
-                                                      device=get_accelerator().current_device_name(),
-                                                      param_group_idx=i,
-                                                      return_tensor_list=True)
-
-                    for accumulated_grad, new_avg_grad in zip(self.averaged_gradients[i], avg_new):
-                        accumulated_grad.add_(new_avg_grad)
+                    self.all_grad_tensors[i] = None
 
         self._release_ipg_buffers()
 
@@ -1844,6 +1839,15 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         return total_norm
 
+    def get_all_grad_tensors(self, tensor_list, dtype):
+        all_grad_tensors = []
+        for i, tensor in enumerate(tensor_list):
+            grad_accum = self.get_param_gradient_attribute(tensor)
+            if grad_accum is None:
+                grad_accum = torch.zeros_like(tensor, dtype=dtype)
+            all_grad_tensors.append(grad_accum)
+        return all_grad_tensors
+    
     # creates a flat fused tensor from the tensor list starting at the first_offset
     # in the first tensor of the list. If there are not enough elements in the tensor
     # list then the flat tensor will be padded with zeros
@@ -1852,6 +1856,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         current_size = 0
         # find the flatten copy in the optimizer's state
         flatten_copy = self.optimizer.param_groups[param_group_idx]['params'][0]
+        if getattr(tensor_list[0], 'use_muon', False) and 'muon' in self.optimizer.__class__.__name__.lower():
+            assert "momentum_buffer" in self.optimizer.state[flatten_copy], f"when reloading from a saved checkpoint, momentum_buffer should have been in the optimizer state"
         if (not self.optimizer.state[flatten_copy]) and getattr(tensor_list[0], 'use_muon', False) and 'muon' in self.optimizer.__class__.__name__.lower():
             self.optimizer.state[flatten_copy] = {}
         if "momentum_buffer" not in self.optimizer.state[flatten_copy] and getattr(tensor_list[0], 'use_muon', False) and 'muon' in self.optimizer.__class__.__name__.lower():
@@ -1862,10 +1868,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         
         buffer_idx = 0
         for i, tensor in enumerate(tensor_list):
-            grad_accum = self.get_param_gradient_attribute(tensor)
-            if grad_accum is None:
-                grad_accum = torch.zeros_like(tensor, dtype=dtype)
-
+            grad_accum = self.all_grad_tensors[param_group_idx][i]
             if getattr(tensor, 'use_muon', False) and 'muon' in self.optimizer.__class__.__name__.lower():
                 assert tensor.ndim > 1, f"if use muon, then tensor dim > 1, got {tensor.size()}"
                 # create a gpu copy
@@ -1994,6 +1997,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             else:
                 for k in self.averaged_gradients.keys():
                     self.averaged_gradients[k] = None
+                    self.all_grad_tensors[k] = None
 
             see_memory_usage('After overflow after clearing gradients')
 
@@ -2055,7 +2059,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 self.free_grad_in_param_list(self.params_in_partition[i])
 
                 self.averaged_gradients[i] = None
-
+                self.all_grad_tensors[i] = None
                 self.unscale_and_clip_grads([single_grad_partition], scaled_global_grad_norm)
 
                 self.timers(OPTIMIZER_GRADIENTS_TIMER).stop()
