@@ -1856,8 +1856,6 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         current_size = 0
         # find the flatten copy in the optimizer's state
         flatten_copy = self.optimizer.param_groups[param_group_idx]['params'][0]
-        if getattr(tensor_list[0], 'use_muon', False) and 'muon' in self.optimizer.__class__.__name__.lower():
-            assert "momentum_buffer" in self.optimizer.state[flatten_copy], f"when reloading from a saved checkpoint, momentum_buffer should have been in the optimizer state"
         if (not self.optimizer.state[flatten_copy]) and getattr(tensor_list[0], 'use_muon', False) and 'muon' in self.optimizer.__class__.__name__.lower():
             self.optimizer.state[flatten_copy] = {}
         if "momentum_buffer" not in self.optimizer.state[flatten_copy] and getattr(tensor_list[0], 'use_muon', False) and 'muon' in self.optimizer.__class__.__name__.lower():
