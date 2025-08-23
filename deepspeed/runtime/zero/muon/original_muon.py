@@ -24,7 +24,7 @@ SOFTWARE.
 """
 
 import torch
-import torch.distributed as dist
+import deepspeed.comm as dist  # replace torch.distributed with deepspeed.comm to resolve deepspeed check
 
 
 def zeropower_via_newtonschulz5(G, steps: int):
