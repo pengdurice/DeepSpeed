@@ -15,7 +15,7 @@ class MuonWithAuxAdam(BaseMuonWithAuxAdam):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-    
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -40,8 +40,8 @@ class MuonWithAuxAdam(BaseMuonWithAuxAdam):
                         state["exp_avg_sq"] = torch.zeros_like(p)
                         state["step"] = 0
                     state["step"] += 1
-                    update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
-                                         state["step"], group["betas"], group["eps"])
+                    update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"], state["step"], group["betas"],
+                                         group["eps"])
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
 

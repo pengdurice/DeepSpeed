@@ -23,6 +23,7 @@ for optimizer_name in ['muon', 'adam']:
                 for nlayer in [5, 10]:
                     muon_configs.append([optimizer_name, stage, lr, model_dim, nlayer])
 
+
 def set_muon_flag(params):
     for p in params:
         if p.ndim >= 2:
@@ -63,13 +64,14 @@ class TestMuonConfigs(DistributedTest):
             model_parameters=model.parameters(),
             dist_init_required=False,
         )
-        assert optimizer_type in optimizer.optimizer.__class__.__name__.lower(), f"Expected optimizer type {optimizer_type}, got {optimizer.optimizer.__class__.__name__}"
+        assert optimizer_type in optimizer.optimizer.__class__.__name__.lower(
+        ), f"Expected optimizer type {optimizer_type}, got {optimizer.optimizer.__class__.__name__}"
         steps = 5
         for _ in range(steps):
             # Random inputs: (batch_size, hidden_dim)
             x = torch.randn(batch_size, hidden_dim, device=engine.device, dtype=torch.half)
             # Random class labels: (batch_size,)
-            y = torch.randint(0, hidden_dim, (batch_size,), device=engine.device)
+            y = torch.randint(0, hidden_dim, (batch_size, ), device=engine.device)
             # Forward + loss
             loss = engine(x, y)
             # Backward
