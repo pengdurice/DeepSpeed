@@ -92,7 +92,7 @@ extras_require = {
     'sd': fetch_requirements('requirements/requirements-sd.txt'),
     'triton': fetch_requirements('requirements/requirements-triton.txt'),
     'deepcompile': fetch_requirements('requirements/requirements-deepcompile.txt'),
-    'muon': ['muon-optimizer @ git+https://github.com/KellerJordan/Muon.git'],
+    'muon': ['muon-optimizer @ git+https://github.com/KellerJordan/Muon.git'], # Muon has not been on PyPI yet, so added in the setup file. 
 }
 
 # Only install pynvml on nvidia gpus.
