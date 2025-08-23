@@ -5,8 +5,8 @@
 
 import torch
 try:
-    from muon import MuonWithAuxAdam as BaseMuonWithAuxAdam
-    from muon import adam_update
+    from deepspeed.runtime.zero.muon.original_muon import MuonWithAuxAdam as BaseMuonWithAuxAdam
+    from deepspeed.runtime.zero.muon.original_muon import adam_update
 except ImportError:
     pass
 
