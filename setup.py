@@ -78,7 +78,10 @@ def get_env_if_set(key, default: typing.Any = ""):
     return os.environ.get(key, None) or default
 
 
-install_requires = fetch_requirements('requirements/requirements.txt')
+install_requires = [
+    fetch_requirements('requirements/requirements.txt'),
+    'muon': ['muon-optimizer @ git+https://github.com/KellerJordan/Muon.git'], # Muon has not been on PyPI yet, so added in the setup file.
+    ]
 extras_require = {
     '1bit': [],  # add cupy based on cuda/rocm version
     '1bit_mpi': fetch_requirements('requirements/requirements-1bit-mpi.txt'),
