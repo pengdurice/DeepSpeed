@@ -1,5 +1,5 @@
 # Copyright (c) 2024 Keller Jordan
-# SPDX-License-Identifier: MIT License
+# SPDX-License-Identifier: MIT
 
 # DeepSpeed Team
 """
