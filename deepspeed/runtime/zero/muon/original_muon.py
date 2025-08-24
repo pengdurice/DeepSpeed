@@ -1,5 +1,5 @@
-# Copyright (c) Microsoft Corporation.
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2024 Keller Jordan
+# SPDX-License-Identifier: MIT License
 
 # DeepSpeed Team
 """
