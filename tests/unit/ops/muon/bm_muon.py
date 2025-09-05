@@ -4,15 +4,7 @@ Runs in 2.59 seconds on a 400W NVIDIA A100
 Attains 94.004 mean accuracy (n=200 trials)
 Descends from https://github.com/tysam-code/hlb-CIFAR10/blob/main/main.py
 """
-"""
-Peng Du and Zhipeng Wang's adoption to test Muon using Deepspeed.
-Steps:
-1. download cifar10 (https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz), unzip and save to <DEEPSPEED_ROOT>/tests/unit/ops/muon/data
-2. install deepspeed (https://www.deepspeed.ai/getting-started/)
-3. run the benchmark script with deepspeed --num_gpus 1 bm_muon.py
-4. play with the hyperparameters in bm_muon.py (lr, eps, etc) to see how they affect performance
 
-"""
 #############################################
 #                  Setup                    #
 #############################################
@@ -154,13 +146,13 @@ class CifarLoader:
     def __init__(self, path, train=True, batch_size=500, aug=None):
         # data_path = os.path.join(path, 'train.pt' if train else 'test.pt')
         #if not os.path.exists(data_path):
-        data_path = "data_saved"
-        dset = torchvision.datasets.CIFAR10("data", download=False, train=train)
+        data_path = "data_saved"+ str(deepspeed.comm.get_local_rank())
+        dset = torchvision.datasets.CIFAR10("data"+ str(deepspeed.comm.get_local_rank()), download=False, train=train)
         images = torch.tensor(dset.data)
         labels = torch.tensor(dset.targets)
         torch.save({'images': images, 'labels': labels, 'classes': dset.classes}, data_path)
 
-        data = torch.load(data_path, map_location=torch.device('cuda'))
+        data = torch.load(data_path, weights_only=False) #
         self.images, self.labels, self.classes = data['images'], data['labels'], data['classes']
         # It's faster to load+process uint8 data than to load preprocessed fp16 data
         self.images = (self.images.half() / 255).permute(0, 3, 1, 2).to(memory_format=torch.channels_last)
@@ -218,7 +210,7 @@ class CifarLoader:
 class BatchNorm(nn.BatchNorm2d):
     def __init__(self, num_features, momentum=0.6, eps=1e-12):
         super().__init__(num_features, eps=eps, momentum=1-momentum)
-        self.weight.requires_grad = False
+        self.weight.requires_grad = True # False
         # Note that PyTorch already initializes the weights to one and bias to zero
 
 class Conv(nn.Conv2d):
@@ -257,7 +249,7 @@ class CifarNet(nn.Module):
         whiten_kernel_size = 2
         whiten_width = 2 * 3 * whiten_kernel_size**2
         self.whiten = nn.Conv2d(3, whiten_width, whiten_kernel_size, padding=0, bias=True)
-        self.whiten.weight.requires_grad = False
+        self.whiten.weight.requires_grad = True # False
         self.layers = nn.Sequential(
             nn.GELU(),
             ConvGroup(whiten_width,     widths['block1']),
@@ -290,9 +282,10 @@ class CifarNet(nn.Module):
 
     def forward(self, x, whiten_bias_grad=True):
         b = self.whiten.bias
-        x = F.conv2d(x, self.whiten.weight, b if whiten_bias_grad else b) #.detach())
+        x = F.conv2d(x.to(self.whiten.weight.device), self.whiten.weight, b if whiten_bias_grad else b) # .detach()) #)
         x = self.layers(x)
         x = x.view(len(x), -1)
+        # return x[..., : 10]
         return self.head(x) / x.size(-1)
 
 ############################################
@@ -366,7 +359,7 @@ def infer(model, loader, tta_level=0):
 
 def evaluate(model, loader, tta_level=0):
     logits = infer(model, loader, tta_level)
-    return (logits.argmax(1) == loader.labels).float().mean().item()
+    return (logits.argmax(1) == loader.labels.to(logits.device)).float().mean().item()
 
 ############################################
 #                Training                  #
@@ -393,16 +386,19 @@ def main_toy(run, model):
         },
         "gradient_clipping": 1.0,
         "fp16": {
-            "enabled": True
+            "enabled": True,
+            "loss_scale": 32
         },
         "zero_optimization": {
             "stage": zero_stage,
+            "reduce_bucket_size": 100
         }
     }
     # Perform a few training steps to ensure the optimizer works correctly
-    hidden_dim = 10
-    nlayer = 3
-    model = SimpleModel(hidden_dim=hidden_dim, nlayers=nlayer)
+    total_size = 0
+    total_count = 0
+    # if deepspeed.comm.get_local_rank() == 0:
+
     if 'muon' in optimizer_type:
         set_muon_flag(model.parameters())
     initial_params = [p.clone().cpu() for p in model.parameters()]
@@ -410,11 +406,16 @@ def main_toy(run, model):
         config=config_dict,
         model=model,
         model_parameters=model.parameters(),
-        dist_init_required=False,
+        dist_init_required=True,
     )
     assert optimizer_type in optimizer.optimizer.__class__.__name__.lower(
     ), f"Expected optimizer type {optimizer_type}, got {optimizer.optimizer.__class__.__name__}"
     steps = 5
+    for n, p in model.named_parameters():
+        print(f"I am {n} with size {p.size()} I am on {deepspeed.comm.get_local_rank()} ")
+        total_size += p.numel()
+        total_count += 1
+    print(f"model # param {total_size}, count {total_count} I am on {deepspeed.comm.get_local_rank()} ")
     for _ in range(steps):
         # Random inputs: (batch_size, hidden_dim)
         x = torch.randn(batch_size, hidden_dim, device=engine.device, dtype=torch.half)
@@ -429,19 +430,10 @@ def main_toy(run, model):
 
 def main_new(run, model):
 
-    batch_size = 5000
+    batch_size = 3200
     bias_lr = 0.053
     head_lr = 0.67
     wd = 2e-6 * batch_size
-
-    test_loader = CifarLoader('cifar10', train=False, batch_size=batch_size)
-    train_loader = CifarLoader('cifar10', train=True, batch_size=batch_size, aug=dict(flip=True, translate=2))
-
-    if run == 'warmup':
-        # The only purpose of the first run is to warmup the compiled model, so we can use dummy data
-        train_loader.labels = torch.randint(0, 10, size=(len(train_loader.labels),), device=train_loader.labels.device)
-    total_train_steps = ceil(8 * len(train_loader))
-    whiten_bias_train_steps = ceil(3 * len(train_loader))
 
     # Create optimizers and learning rate schedulers
     # filter_params = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
@@ -455,17 +447,17 @@ def main_new(run, model):
     # for opt in optimizers:
     #     for group in opt.param_groups:
     #         group["initial_lr"] = group["lr"]
-    lr = 0.1
+    lr = 0.09
     optimizer_params = {
         "lr": lr,
         "betas": [0.9, 0.999],
         "eps": 1e-11,
         "weight_decay": 0.001
         }
-    optimizer_type = 'muon'
+    optimizer_type = 'adam'
     if optimizer_type == 'muon':
         optimizer_params.update({'momentum': 0.99995})
-    zero_stage = 1
+    zero_stage = 2
 
     config_dict = {
         "train_batch_size": batch_size,
@@ -481,10 +473,11 @@ def main_new(run, model):
         },
         "zero_optimization": {
             "stage": zero_stage,
+            "reduce_bucket_size": 200000000
         }
     }
     # Perform a few training steps to ensure the optimizer works correctly
-
+    
     if 'muon' in optimizer_type:
         set_muon_flag(model.parameters())
     engine, optimizer, _, _ = deepspeed.initialize(
@@ -493,6 +486,19 @@ def main_new(run, model):
         model_parameters=model.parameters(),
         dist_init_required=True,
     )
+    total_size = 0
+    # if deepspeed.comm.get_local_rank() == 0:
+    for n, p in model.named_parameters():
+        print(f"I am {n} with size {p.size()} I am on {deepspeed.comm.get_local_rank()} ")
+        total_size += p.numel()
+    print(f"model # param {total_size}, I am on {deepspeed.comm.get_local_rank()} ")
+    test_loader = CifarLoader('cifar10', train=False, batch_size=batch_size)
+    train_loader = CifarLoader('cifar10', train=True, batch_size=batch_size, aug=dict(flip=True, translate=2))
+    if run == 'warmup':
+        # The only purpose of the first run is to warmup the compiled model, so we can use dummy data
+        train_loader.labels = torch.randint(0, 10, size=(len(train_loader.labels),), device=train_loader.labels.device)
+    total_train_steps = ceil(8 * len(train_loader))
+    whiten_bias_train_steps = ceil(3 * len(train_loader))
     # For accurately timing GPU code
     starter = torch.cuda.Event(enable_timing=True)
     ender = torch.cuda.Event(enable_timing=True)
@@ -512,7 +518,7 @@ def main_new(run, model):
     start_timer()
     #train_normalize = T.Normalize(CIFAR_MEAN, CIFAR_STD)
     train_images = train_loader.normalize(train_loader.images[:5000])
-    model.init_whiten(train_images)
+    # model.init_whiten(train_images)
     stop_timer()
 
     for epoch in range(ceil(total_train_steps / len(train_loader))):
@@ -526,10 +532,10 @@ def main_new(run, model):
         for inputs, labels in train_loader:
             # outputs = model(inputs, whiten_bias_grad=(step < whiten_bias_train_steps))
             # F.cross_entropy(outputs, labels, label_smoothing=0.2, reduction='sum').backward()
-
+            # print(f"on rank {deepspeed.comm.get_rank()}, input device: {inputs.device}")
             loss, outputs = engine(inputs, step < whiten_bias_train_steps, labels) # step < whiten_bias_train_steps
             for group in engine.optimizer.optimizer.param_groups:
-                group['lr'] = lr * math.pow(max(1 - step / whiten_bias_train_steps, 0.01), 0.5)
+                group['lr'] = lr * math.pow(max(1 - step / whiten_bias_train_steps, 0.01), 0.6)
             # print(f"loss is {loss}")
             # Backward
             engine.backward(loss)
@@ -545,11 +551,11 @@ def main_new(run, model):
         ####################
 
         # Save the accuracy and loss from the last training batch of the epoch
-        train_acc = (outputs.detach().argmax(1) == labels).float().mean().item()
+        train_acc = (outputs.detach().argmax(1) == labels.to(outputs.device)).float().mean().item()
         val_acc = evaluate(model, test_loader, tta_level=0)
         print_training_details(locals(), is_final_entry=False)
         run = None # Only print the run number once
-
+        
     ####################
     #  TTA Evaluation  #
     ####################
@@ -559,7 +565,7 @@ def main_new(run, model):
     stop_timer()
     epoch = 'eval'
     print_training_details(locals(), is_final_entry=True)
-
+    del engine
     return tta_val_acc
 
 
@@ -668,14 +674,14 @@ def main_backup(run, model):
 class WrapModel(torch.nn.Module):
     def __init__(self,):
         super(WrapModel, self).__init__()
-        self.cifarnet = CifarNet().cuda().to(memory_format=torch.channels_last)
-        self.cifarnet.compile(mode='max-autotune')
+        self.cifarnet = CifarNet().to(memory_format=torch.channels_last)
+        # self.cifarnet.compile(mode='max-autotune')
         self.loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=0.2, reduction='sum')
     
     def forward(self, inputs,whiten_bias_grad=True, labels=None):
         outputs = self.cifarnet(inputs, whiten_bias_grad)
         if labels is not None:
-            return self.loss_fn(outputs, labels), outputs
+            return self.loss_fn(outputs, labels.to(outputs.device)), outputs
         else:
             return outputs
 
@@ -687,7 +693,7 @@ class WrapModel(torch.nn.Module):
 if __name__ == "__main__":
 
     # We re-use the compiled model between runs to save the non-data-dependent compilation time
-    flag = 2 # 1 is keep old impelmetnation, 2 is using new
+    flag = 3 # 1 is keep old impelmetnation, 2 is using new
     if flag == 1:
         main = main_backup
         model = CifarNet().cuda().to(memory_format=torch.channels_last)
@@ -697,15 +703,22 @@ if __name__ == "__main__":
         model = WrapModel()
     else:
         main = main_toy
-        model = None
+        hidden_dim = 10
+        nlayer = 3
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=nlayer)
 
-    print_columns(logging_columns_list, is_head=True)
-    main('warmup', model)
-    accs = torch.tensor([main(run, model) for run in range(20)])
-    print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
+    if flag == 3:
+        for run in range (29):
+            print(f"run is {run}")
+            main(run, model)
+    else:
+        print_columns(logging_columns_list, is_head=True)
+        main('warmup', model)
+        accs = torch.tensor([main(run, model) for run in range(20)])
+        print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
 
-    log_dir = os.path.join('logs', str(uuid.uuid4()))
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, 'log.pt')
-    torch.save(dict(code=code, accs=accs), log_path)
-    print(os.path.abspath(log_path))
+        log_dir = os.path.join('logs', str(uuid.uuid4()))
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, 'log.pt')
+        torch.save(dict(code=code, accs=accs), log_path)
+        print(os.path.abspath(log_path))
