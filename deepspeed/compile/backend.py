@@ -4,6 +4,7 @@
 # DeepSpeed Team
 
 from typing import Dict, List, Callable, Tuple, Set
+import os
 import time
 import gc
 from collections import OrderedDict, deque
@@ -38,6 +39,29 @@ remaining_schedule = None
 next_pass_step = -1
 next_passes = None
 current_passes = None
+
+
+def _dump_enabled():
+    return os.environ.get("DC_DUMP", "0") == "1" and dist.get_rank() == 0
+
+
+def dump_graph(tag: str, gm: GraphModule, graph_id: int, bwd):
+    if not _dump_enabled():
+        return
+    header = f"[DeepCompile][graph] {tag} graph_id={graph_id} bwd={bwd}"
+    print(f"{header} BEGIN ({len(gm.graph.nodes)} nodes)", flush=True)
+    print(gm.graph, flush=True)
+    print(f"{header} END", flush=True)
+
+
+def dump_mem_profile(tag: str, mem, graph_id: int, bwd):
+    if not _dump_enabled():
+        return
+    header = f"[DeepCompile][profile-table] memory {tag} graph_id={graph_id} bwd={bwd}"
+    print(f"{header} BEGIN ({len(mem)} rows: name current_alloc delta peak)", flush=True)
+    for name, current_alloc, delta, peak in mem:
+        print(f"[DeepCompile][profile-table] {name} alloc={current_alloc} delta={delta} peak={peak}", flush=True)
+    print(f"{header} END", flush=True)
 
 param_manager: Dict[int, DSGraphParamManager] = {}
 
@@ -96,9 +120,14 @@ def init_schedule(schedule):
 def launch_compile_passes(global_steps: int):
     global next_pass_step, next_passes
 
+    log_rank0(
+        f"[DeepCompile][step] global_steps={global_steps} "
+        f"pending_phase_starts={[s for s, _ in remaining_schedule]}", True)
     if len(remaining_schedule) > 0 and global_steps == remaining_schedule[0][0]:
         _, next_passes = remaining_schedule.popleft()
-        log_rank0(f"Launching compile passes: global_steps={global_steps} passes={next_passes}", True)
+        log_rank0(
+            f"Launching compile passes: global_steps={global_steps} "
+            f"passes={[getattr(p, '__name__', str(p)) for p in next_passes]}", True)
 
         torch._dynamo.reset()
         get_deepcompile_handle().reset()
@@ -213,8 +242,17 @@ def run_opt_passes(opt_passes: List[Callable],
         gc.collect()
         get_accelerator().empty_cache()
 
+    dump_graph("before-passes", gm, graph_id, bwd)
+
     for i, opt_pass_fn in enumerate(opt_passes):
         log_rank0(f"Running opt pass {i} for graph {graph_id}. bwd={bwd}", enable=debug_log)
+
+        pass_name = getattr(opt_pass_fn, '__name__', str(opt_pass_fn))
+        nodes_before = len(gm.graph.nodes)
+        log_rank0(
+            f"[DeepCompile][passes] graph={graph_id} bwd={bwd} pass {i + 1}/{len(opt_passes)}: {pass_name} "
+            f"starting (nodes={nodes_before})", True)
+        pass_start = time.time()
 
         gm_new = opt_pass_fn(gm, graph_id, graph_order, profiling_results, create_inputs_fn, mem_budget, param_manager,
                              bwd)
@@ -233,6 +271,19 @@ def run_opt_passes(opt_passes: List[Callable],
 
             set_time_and_tensor_size(graph_id, gm.graph, mem, bwd, profiling_results, profile_complete)
 
+            dump_graph(f"after-{pass_name}", gm, graph_id, bwd)
+            dump_mem_profile(f"after-{pass_name}", mem, graph_id, bwd)
+
+            peak = max((m[3] for m in mem), default=0)
+            log_rank0(
+                f"[DeepCompile][passes] graph={graph_id} bwd={bwd} pass {pass_name} done in "
+                f"{time.time() - pass_start:.1f}s: nodes {nodes_before}->{len(gm.graph.nodes)}, "
+                f"post-pass mem profile: complete={profile_complete} peak={peak / 1e9:.2f}GB", True)
+        else:
+            log_rank0(
+                f"[DeepCompile][passes] graph={graph_id} bwd={bwd} pass {pass_name} done in "
+                f"{time.time() - pass_start:.1f}s: returned None (graph unchanged, re-profiling skipped)", True)
+
         with unset_fake_temporarily():
             get_accelerator().synchronize()
             gc.collect()
@@ -246,6 +297,8 @@ def make_backend(backend, compile_config, compile_kwargs={}):
     # Extract values from compile_config
     debug_log = compile_config.debug_log
     free_activation = compile_config.free_activation and not is_backend_inductor(backend)
+
+    log_rank0(f"[DeepCompile][compile] make_backend: backend={backend} free_activation={free_activation}", True)
 
     def backend_fn(gm: GraphModule, real_inputs):
         graph_id = id(gm.graph)
@@ -270,6 +323,11 @@ def make_backend(backend, compile_config, compile_kwargs={}):
                        if isinstance(v, torch.nn.Parameter)), "All param inputs should have param_id"
             param_indices = [(i, input_val.param_id, input_val.shape) for i, input_val in enumerate(real_inputs)
                              if isinstance(input_val, torch.nn.Parameter)]
+
+        log_rank0(
+            f"[DeepCompile][compile] dynamo captured graph: graph_id={graph_id} frame_id={frame_id} "
+            f"nodes={len(gm.graph.nodes)} inputs={len(real_inputs)} ds_params={len(param_indices)}", True)
+        dump_graph("dynamo-captured", gm, graph_id, bwd=None)
 
         global fwd_real_inputs
 
@@ -296,6 +354,10 @@ def make_backend(backend, compile_config, compile_kwargs={}):
             needs_backward = frame_id in frames_partitioned
             graph_order_with_frame_id.set_needs_backward(frame_id, needs_backward)
             profiling_results[graph_id].needs_backward = needs_backward
+
+            log_rank0(
+                f"[DeepCompile][compile] fw_compiler start: graph_index={graph_index} graph_id={graph_id} "
+                f"needs_backward={needs_backward} nodes={len(gm.graph.nodes)}", True)
 
             if needs_backward:
                 if len(frames_needing_bwd) == 0:
@@ -336,6 +398,10 @@ def make_backend(backend, compile_config, compile_kwargs={}):
             log_rank0(f"Fwd end {graph_index} graph_id={graph_id} alloc_mem={get_accelerator().memory_allocated()}",
                       enable=debug_log)
 
+            log_rank0(
+                f"[DeepCompile][compile] fw_compiler done: graph_index={graph_index} graph_id={graph_id} "
+                f"elapsed={time.time() - time_start:.1f}s", True)
+
             return gm.graph
 
         def make_bw_graph(gm, sample_inputs):
@@ -346,6 +412,10 @@ def make_backend(backend, compile_config, compile_kwargs={}):
             log_rank0(
                 f"Bwd start {graph_index} graph_id={graph_id} alloc_mem={get_accelerator().memory_allocated()} graph={gm.graph}",
                 enable=debug_log)
+
+            log_rank0(
+                f"[DeepCompile][compile] bw_compiler start: graph_index={graph_index} graph_id={graph_id} "
+                f"nodes={len(gm.graph.nodes)}", True)
 
             bwd_inputs_stack = get_backward_inputs()
 
@@ -390,6 +460,10 @@ def make_backend(backend, compile_config, compile_kwargs={}):
                 enable=debug_log)
 
             opt_pass_times.append(("bwd", graph_index, graph_id, time.time() - time_start))
+
+            log_rank0(
+                f"[DeepCompile][compile] bw_compiler done: graph_index={graph_index} graph_id={graph_id} "
+                f"elapsed={time.time() - time_start:.1f}s", True)
 
             return gm.graph
 

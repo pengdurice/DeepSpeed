@@ -3,6 +3,7 @@
 
 # DeepSpeed Team
 
+import os
 import time
 from typing import Any, Tuple, Dict
 import statistics
@@ -110,6 +111,11 @@ def _run_repeatedly_for_profile(call_fn, iteration, start_events, end_events):
     return out
 
 
+def _print_rank0_profile(msg):
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        print(f"[DeepCompile][profile] {msg}", flush=True)
+
+
 def _get_mem_usage_out_of_torch():
 
     adjust = 0
@@ -157,6 +163,10 @@ class ProfilingInterpreter(Interpreter):
         """
         return_val = None
         profile_complete = True
+        profile_start_time = time.time()
+        _print_rank0_profile(f"node-level profiling start: {len(list(self.graph.nodes))} nodes, "
+                             f"{self.iteration} timed iters + {self.warmup} warmup per node, "
+                             f"alloc={get_accelerator().memory_allocated() / 1e9:.2f}GB")
         try:
             assert _all_real_if_tensor(args), "Inputs must be real tensors"
             self.nz3.enable_profiling(True)
@@ -178,7 +188,45 @@ class ProfilingInterpreter(Interpreter):
                     self.nz3.enable_profiling(False)
                 finally:
                     _backfill_missing_profile_metadata(self.graph, profile_complete=profile_complete)
+        try:
+            self._print_summary(time.time() - profile_start_time, profile_complete)
+        except Exception:
+            pass
         return return_val
+
+    def _print_summary(self, elapsed, profile_complete):
+        if self.distributed and dist.get_rank() != 0:
+            return
+        nodes = [n for n in self.graph.nodes if n.op not in ("placeholder", "output")]
+        total_dev = sum(n.meta.get("device_time", 0.0) for n in nodes)
+        ag_nodes = [n for n in nodes if n.target == torch.ops.dc.allgather_param.default]
+        ag_time = sum(n.meta.get("device_time", 0.0) for n in ag_nodes)
+        print(f"[DeepCompile][profile] node-level profiling done in {elapsed:.1f}s: complete={profile_complete} "
+              f"{len(nodes)} nodes, sum(device_time)={total_dev:.1f}ms "
+              f"(allgather: {len(ag_nodes)} nodes {ag_time:.1f}ms)", flush=True)
+        slowest = sorted(nodes, key=lambda n: n.meta.get("device_time", 0.0), reverse=True)[:5]
+        for n in slowest:
+            print(f"[DeepCompile][profile]   slowest: {n.name} device_time={n.meta.get('device_time', 0.0):.2f}ms "
+                  f"alloc={n.meta.get('alloc_mem', 0) / 1e6:.1f}MB", flush=True)
+        peaky = sorted(nodes, key=lambda n: n.meta.get("max_mem", 0), reverse=True)[:5]
+        for n in peaky:
+            print(f"[DeepCompile][profile]   peak-mem: {n.name} max_mem={n.meta.get('max_mem', 0) / 1e9:.2f}GB",
+                  flush=True)
+
+        if os.environ.get("DC_DUMP", "0") == "1":
+            header = "[DeepCompile][profile-table] node-level profile"
+            print(f"{header} BEGIN ({len(nodes)} rows: name target device_time_ms wall_time_ms "
+                  f"alloc_mem max_mem tensor_size)",
+                  flush=True)
+            for n in nodes:
+                print(f"[DeepCompile][profile-table] {n.name} target={n.target} "
+                      f"device_time={n.meta.get('device_time', 0.0):.3f} "
+                      f"wall_time={n.meta.get('wall_time', 0.0):.3f} "
+                      f"alloc_mem={n.meta.get('alloc_mem', 0)} "
+                      f"max_mem={n.meta.get('max_mem', 0)} "
+                      f"tensor_size={n.meta.get('tensor_size', 0)}",
+                      flush=True)
+            print(f"{header} END", flush=True)
 
     def run_node(self, n: torch.fx.Node) -> Any:
 
@@ -322,6 +370,8 @@ class MemoryProfilingInterpreter(Interpreter):
     def run(self, *args) -> Any:
         return_val = None
         self.profile_complete = True
+        _print_rank0_profile(f"memory profiling start: {self.node_num} nodes, "
+                             f"alloc={self.last_alloc / 1e9:.2f}GB")
         try:
             assert _all_real_if_tensor(args), "Inputs must be real tensors"
             self.nz3.enable_profiling(True)
@@ -340,6 +390,15 @@ class MemoryProfilingInterpreter(Interpreter):
             finally:
                 self.nz3.enable_profiling(False)
 
+        try:
+            if self.mem_record:
+                peak_rec = max(self.mem_record, key=lambda r: r[3])
+                _print_rank0_profile(f"memory profiling done: {len(self.mem_record)} nodes, "
+                                     f"final_alloc={self.mem_record[-1][1] / 1e9:.2f}GB "
+                                     f"peak={peak_rec[3] / 1e9:.2f}GB at node={peak_rec[0]} "
+                                     f"complete={self.profile_complete}")
+        except Exception:
+            pass
         return return_val
 
     def run_node(self, n: torch.fx.Node) -> Any:

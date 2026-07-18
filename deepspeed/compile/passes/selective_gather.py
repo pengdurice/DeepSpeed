@@ -25,7 +25,11 @@ MEM_MARGIN = 0.1
 
 
 def print_rank_0(message):
+    # log_dist is filtered out under some launchers (its records never reach the
+    # training log), so print directly like the prefetch pass does.
     log_dist(message, ranks=[0])
+    if dist.get_rank() == 0:
+        print(message, flush=True)
 
 
 def _maybe_update_size_from_profile(ds_id_to_size: Dict[int, int], ds_id: int, tensor_size: int) -> None:
@@ -78,6 +82,7 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
     target_graph_id = graph_id
 
     if not bwd:
+        print_rank_0(f"[DeepCompile][selective_gather] graph_id={graph_id} bwd=False: skip (runs only on backward)")
         return gm
 
     last_backward_graph_id = None
@@ -88,7 +93,12 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
 
     # Run only on the last backward graph
     if last_backward_graph_id is None or graph_id != last_backward_graph_id:
+        print_rank_0(f"[DeepCompile][selective_gather] graph_id={graph_id} bwd=True: skip "
+                     f"(runs only on the last backward graph, which is {last_backward_graph_id})")
         return gm
+
+    print_rank_0(f"[DeepCompile][selective_gather] graph_id={graph_id}: running (last backward graph reached; "
+                 f"decides persistence globally for all {len(graph_order)} graphs)")
 
     incomplete_profile_ids = [
         profile_graph_id for profile_graph_id, prof in profiling_results.items() if _profile_result_incomplete(prof)
@@ -149,6 +159,13 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
 
     ds_ids = [ds_id for ds_id in ds_id_to_size if ds_id not in persistent_ds_ids]
     ds_ids.sort(key=lambda ds_id: _time_per_byte(ds_id_to_time, ds_id_to_size, ds_id), reverse=True)
+
+    for ds_id in ds_ids[:10]:
+        size = ds_id_to_size.get(ds_id, 0)
+        ag_time = ds_id_to_time[ds_id]
+        time_per_mb = (ag_time / (size / 1e6)) if size > 0 else 0.0
+        print_rank_0(f"[DeepCompile][selective_gather] top candidate: ds_id={ds_id} size={size / 1e6:.1f}MB "
+                     f"fwd+bwd ag_time={ag_time:.3f}ms time_per_MB={time_per_mb:.5f}ms")
 
     # print(f"ds_id_to_size={ds_id_to_size}")
     # print(f"ds_id_to_time={ds_id_to_time}")

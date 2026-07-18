@@ -62,10 +62,15 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
     graph = gm.graph
     total_param_size = sum(
         [tensor_size_dict[n.name] for n in graph.nodes if n.target == torch.ops.dc.allgather_param.default])
+    num_ag = sum(1 for n in graph.nodes if n.target == torch.ops.dc.allgather_param.default)
+    num_nodes_before = len(graph.nodes)
 
     print_rank_0(
         f"schedule_prefetch graph_id={graph_id} max_mem={max_mem} available_memory={get_accelerator().available_memory()} memory_allocated={get_accelerator().memory_allocated()} max_allocated={get_accelerator().max_memory_allocated()} total_param_size={total_param_size} margin={MARGIN}"
     )
+    print_rank_0(f"[DeepCompile][prefetch] graph_id={graph_id} bwd={bwd} start: {num_ag} allgather nodes, "
+                 f"total gathered bytes={total_param_size / 1e9:.2f}GB, budget max_mem={max_mem / 1e9:.2f}GB, "
+                 f"inflight cap={MAX_BUFFERED_SIZE / 1e9:.1f}GB, fuse size cap={MAX_FUSE_SIZE / 1e9:.1f}GB")
 
     # Fill missing values
     prev_mem = 0
@@ -85,6 +90,8 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
     prefetch_ags = []
     prefetch_ag_groups = []
     ag_tensor_size_sum = 0
+    fuse_true = 0
+    fuse_false = 0
     for i, node in enumerate(order_rev):
         # print_rank_0(
         #     f"Checking node reverse order {node.name} {node.target} ag_tensor_size_sum={ag_tensor_size_sum} max_mem={max_mem}"
@@ -105,6 +112,11 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
                     ag_tensor_size_sum -= total_ag_tensor_size
                     new_order_rev.append(fused_ag_nodes)
                     assert len(fused_ag_nodes) > 0
+                    print_rank_0(
+                        f"[DeepCompile][prefetch] flush: cannot hoist past node={node.name}, emitting group of "
+                        f"{len(fused_ag_nodes)} allgathers ({total_ag_tensor_size / 1e6:.1f}MB) here; "
+                        f"budget: next_peak={next_peak / 1e9:.2f}GB + inflight={ag_tensor_size_sum / 1e9:.2f}GB "
+                        f"vs max_mem={max_mem / 1e9:.2f}GB")
                     # print_rank_0(
                     #     f"Free up memory fused_ag_nodes={fused_ag_nodes} next_alloc_mem={next_alloc_mem} total_ag_tensor_size={total_ag_tensor_size} ag_tensor_size_sum={ag_tensor_size_sum} max_mem={max_mem}"
                     # )
@@ -126,6 +138,10 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
 
                 do_fuse = max(pred_time_current, pred_time_next) * 1.2 > pred_time_fused and (
                     current_ag_size + tensor_size_dict[node.name]) < MAX_FUSE_SIZE
+                if do_fuse:
+                    fuse_true += 1
+                else:
+                    fuse_false += 1
                 # print_rank_0(
                 #     f"found allgather_param do_fuse={do_fuse} current_ag_size={current_ag_size} tensor_size_dict[node.name]={tensor_size_dict[node.name]} pred_time_current={pred_time_current} pred_time_next={pred_time_next} pred_time_fused={pred_time_fused}"
                 # )
@@ -152,9 +168,13 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
                 new_order_rev.append(ag_group)
                 total_ag_tensor_size = sum([tensor_size_dict[ag_node.name] for ag_node in ag_group])
                 ag_tensor_size_sum -= total_ag_tensor_size
+                print_rank_0(f"[DeepCompile][prefetch] graph-top emit: group of {len(ag_group)} allgathers "
+                             f"({total_ag_tensor_size / 1e6:.1f}MB) prefetched at graph start")
             if len(prefetch_ags) > 0:
                 new_order_rev.append(prefetch_ags)
                 ag_tensor_size_sum -= sum([tensor_size_dict[ag_node.name] for ag_node in prefetch_ags])
+                print_rank_0(f"[DeepCompile][prefetch] graph-top emit: pending group of {len(prefetch_ags)} "
+                             f"allgathers prefetched at graph start")
             assert ag_tensor_size_sum == 0
 
         # print_rank_0(
@@ -179,5 +199,10 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
                                     args=(graph_id, param_nodes_copy, ds_ids))
     new_graph.lint()
     gm.graph = new_graph
+
+    n_groups = sum(1 for x in new_order_rev if not isinstance(x, Node))
+    print_rank_0(f"[DeepCompile][prefetch] graph_id={graph_id} bwd={bwd} done: {num_ag} allgathers hoisted into "
+                 f"{n_groups} prefetch_params_fused groups (fuse decisions: kept-fusing={fuse_true} "
+                 f"split={fuse_false}); nodes {num_nodes_before}->{len(gm.graph.nodes)}")
 
     return gm

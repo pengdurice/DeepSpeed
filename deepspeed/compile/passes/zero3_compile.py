@@ -166,6 +166,11 @@ def add_z3_gather_release_fw(gm: GraphModule,
             # Used for Inductor's validation
             n.meta["val"] = torch.empty([0], dtype=n.meta['val'].dtype, device=n.meta['val'].device)
 
+    if rank == 0:
+        print(f"[DeepCompile][passes] add_z3_gather_release fwd graph {graph_index}: applying fast_free_schedule "
+              f"(memory-aware release reordering), available_memory={get_accelerator().available_memory() / 1e9:.2f}GB",
+              flush=True)
+
     gm.graph = fast_free_schedule(
         gm.graph,
         get_accelerator().available_memory(),
@@ -204,6 +209,11 @@ def add_z3_gather_release_bw(gm: GraphModule,
     if rank == 0 and debug_log:
         print(f"Bwd before scheduling graph {graph_index} graph_id={graph_id} {gm.graph}")
 
+    if rank == 0:
+        print(f"[DeepCompile][passes] add_z3_gather_release bwd graph {graph_index}: applying fast_free_schedule "
+              f"(memory-aware release reordering), available_memory={get_accelerator().available_memory() / 1e9:.2f}GB",
+              flush=True)
+
     gm.graph = fast_free_schedule(
         gm.graph,
         get_accelerator().available_memory(),
@@ -219,17 +229,27 @@ def add_z3_gather_release_bw(gm: GraphModule,
 def add_z3_gather_release(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], profiling_results,
                           create_inputs_fn, mem_budget: float, param_manager, bwd: bool) -> GraphModule:
     if bwd:
-        return add_z3_gather_release_bw(gm,
-                                        graph_id,
-                                        graph_order,
-                                        profiling_results,
-                                        create_inputs_fn,
-                                        param_manager,
-                                        debug_log=False)
-    return add_z3_gather_release_fw(gm,
-                                    graph_id,
-                                    graph_order,
-                                    profiling_results,
-                                    create_inputs_fn,
-                                    param_manager,
-                                    debug_log=False)
+        gm = add_z3_gather_release_bw(gm,
+                                      graph_id,
+                                      graph_order,
+                                      profiling_results,
+                                      create_inputs_fn,
+                                      param_manager,
+                                      debug_log=False)
+    else:
+        gm = add_z3_gather_release_fw(gm,
+                                      graph_id,
+                                      graph_order,
+                                      profiling_results,
+                                      create_inputs_fn,
+                                      param_manager,
+                                      debug_log=False)
+
+    if dist.get_rank() == 0:
+        num_allgather = sum(1 for n in gm.graph.nodes if n.target == torch.ops.dc.allgather_param.default)
+        num_release = sum(1 for n in gm.graph.nodes if n.target == torch.ops.dc.release_param.default)
+        num_reduce = sum(1 for n in gm.graph.nodes if n.target == torch.ops.dc.reduce_grad.default)
+        print(f"[DeepCompile] add_z3_gather_release: graph_id={graph_id} bwd={bwd} inserted "
+              f"allgather_param={num_allgather} release_param={num_release} reduce_grad={num_reduce}",
+              flush=True)
+    return gm

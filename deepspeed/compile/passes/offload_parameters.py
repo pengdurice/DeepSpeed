@@ -7,6 +7,7 @@ from typing import List, Tuple
 
 import torch
 from torch.fx import Node, GraphModule
+import deepspeed.comm as dist
 from deepspeed.compile.util import get_last_uses
 from ..graph_param import DSGraphParamManager
 
@@ -47,9 +48,14 @@ def offload_parameter_fwd(gm: GraphModule, graph_id: int, graph_order: List[Tupl
                           create_inputs_fn, mem_budget: float, param_manager: DSGraphParamManager,
                           bwd: bool) -> GraphModule:
     node_to_last_use, user_to_last_uses = get_last_uses(gm.graph)
+    num_offload_pairs = 0
     for node in gm.graph.nodes:
         if (isinstance(node, Node) and node.target == torch.ops.dc.allgather_param.default):
             add_reload_parameter(graph_id, gm, node.args[0], get_ds_id(node))
             add_offload_parameter(graph_id, gm, node_to_last_use[node], get_ds_id(node))
+            num_offload_pairs += 1
+    if dist.get_rank() == 0:
+        print(f"[DeepCompile] offload_parameter_fwd: graph_id={graph_id} bwd={bwd} inserted "
+              f"reload/offload pairs for {num_offload_pairs} param shards", flush=True)
     gm.graph.lint()
     return gm

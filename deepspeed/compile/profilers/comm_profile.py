@@ -126,6 +126,9 @@ profile_results = None
 def create_predictor():
     global profile_results
     if profile_results is None:
+        if dist.get_rank() == 0:
+            print(f"[DeepCompile][profile] benchmarking allgather latency curve "
+                  f"(bf16, sizes up to 2^30 elems, world_size={dist.get_world_size()})...", flush=True)
         with unset_fake_temporarily():
             device = get_accelerator().current_device()
             profile_results = run_all_gather(device, torch.bfloat16, 31)
