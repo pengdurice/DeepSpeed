@@ -88,17 +88,16 @@ def test_fwd_insertion_schedules_all_tasks_under_forced_budget(monkeypatch):
     _run_fwd_pass(monkeypatch, graph)
 
     names = [n.name for n in graph.nodes]
-    launch_names = [n for n in names if n.startswith("offload_opt_") and "sync" not in n]
-    sync_names = [n for n in names if n.startswith("offload_opt_sync_")]
+    launch_names = [n for n in names if n.startswith("offload_opt_")]
 
     assert len(launch_names) == 3, f"expected exp_avg/exp_avg_sq/hp_param launches, got {launch_names}"
-    assert len(sync_names) == 3
     assert any("hp_param" in n for n in launch_names)
+    # Frees are completion-driven via record_stream inside the launch op; no sync nodes exist.
+    assert not any("sync" in n for n in launch_names)
 
-    # All copies launch at the top of the graph, before every wait/free, before all compute.
+    # All copies launch at the top of the graph, before all compute.
     first_compute = names.index("relu")
-    assert max(names.index(n) for n in launch_names) < min(names.index(n) for n in sync_names)
-    assert max(names.index(n) for n in sync_names) < first_compute
+    assert max(names.index(n) for n in launch_names) < first_compute
 
 
 def test_fwd_insertion_offloads_only_the_deficit(monkeypatch):
@@ -110,8 +109,8 @@ def test_fwd_insertion_offloads_only_the_deficit(monkeypatch):
     graph = _make_fwd_graph()
     _run_fwd_pass(monkeypatch, graph, budget_gb="8e-8")
 
-    sync_names = [n.name for n in graph.nodes if n.name.startswith("offload_opt_sync_")]
-    assert sync_names == ["offload_opt_sync_0_exp_avg"]
+    launch_names = [n.name for n in graph.nodes if n.name.startswith("offload_opt_")]
+    assert launch_names == ["offload_opt_0_exp_avg"]
     assert len(offload_pass.offload_tasks_scheduled) == 1
 
 
@@ -125,8 +124,8 @@ def test_pass_reruns_do_not_double_append(monkeypatch):
     _run_fwd_pass(monkeypatch, graph_second)
     assert len(offload_pass.offload_tasks_scheduled) == 3
 
-    sync_names = [n.name for n in graph_second.nodes if n.name.startswith("offload_opt_sync_")]
-    assert len(sync_names) == 3
+    launch_names = [n.name for n in graph_second.nodes if n.name.startswith("offload_opt_")]
+    assert len(launch_names) == 3
 
 
 def test_bwd_insertion_reloads_at_graph_end(monkeypatch):
@@ -152,6 +151,19 @@ def test_bwd_insertion_reloads_at_graph_end(monkeypatch):
     # With a zero budget there is no mid-graph headroom, so every reload lands at the end of the
     # last backward graph, followed by the copy-stream sync.
     assert names.index("sync_offload_copy_stream") > max(names.index(n) for n in reload_names)
+    # Running the backward pass re-arms the once-per-phase empty_cache.
+    assert offload_pass._empty_cache_pending is True
+
+
+def test_empty_cache_runs_once_per_phase(monkeypatch):
+    calls = []
+    monkeypatch.setattr(offload_pass, "get_accelerator", lambda: SimpleNamespace(empty_cache=lambda: calls.append(1)))
+
+    offload_pass._empty_cache_pending = True
+    offload_pass._opt_empty_cache_impl(None)
+    offload_pass._opt_empty_cache_impl(None)
+
+    assert len(calls) == 1
 
 
 class TestOffloadOptStates(DistributedTest):
@@ -205,5 +217,5 @@ class TestOffloadOptStates(DistributedTest):
 
         stats = offload_pass.get_offload_op_stats()
         assert stats["launches"] > 0, "offload launch ops never executed"
-        assert stats["syncs"] == stats["launches"]
         assert stats["reloads"] > 0, "reload ops never executed outside profiling"
+        assert stats["reloads"] <= stats["launches"]

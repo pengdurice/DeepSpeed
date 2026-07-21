@@ -76,6 +76,10 @@ def move_key(state, key, key_event=None):
 
     with get_accelerator().stream(copy_stream):
         state[offload_buf_key].copy_(state[key], non_blocking=True)
+        # Callers may drop their reference to state[key] without waiting for this copy; keep the
+        # allocator from recycling the block until copy_stream has finished reading it.
+        if state[key].device.type != "cpu":
+            state[key].record_stream(copy_stream)
 
     if key_event is None:
         offload_event.record(stream=copy_stream)
@@ -201,10 +205,10 @@ def sync_reload_states(event=None):
 _op_task_registry = []
 _offload_ops_lib = None
 
-# Rank-local counts of op executions. Launch/sync also run during pass-time memory profiling;
+# Rank-local counts of op executions. Launches also run during pass-time memory profiling;
 # reloads are skipped while profiling, so "reloads" only counts real training steps. Tests use
 # these to assert the offload machinery actually ran.
-_offload_op_stats = {"launches": 0, "syncs": 0, "reloads": 0}
+_offload_op_stats = {"launches": 0, "reloads": 0}
 
 
 def get_offload_op_stats():
@@ -222,10 +226,9 @@ def _register_op_task(task) -> int:
 
 
 def _offload_event_key(task):
-    # hp_param tasks carry (hp_param, pin_buffer) in task[1]; key their event on
-    # the GPU tensor so launch and sync agree (the old closure code created the
-    # event under task[1] but recorded under task[1][0], raising KeyError as
-    # soon as an hp_param task was actually launched).
+    # hp_param tasks carry (hp_param, pin_buffer) in task[1]; key their completion event on the
+    # GPU tensor (the old closure code created the event under task[1] but recorded under
+    # task[1][0], raising KeyError as soon as an hp_param task was actually launched).
     return task[1][0] if task[2] == "hp_param" else task[1]
 
 
@@ -242,19 +245,12 @@ def _offload_opt_launch_impl(anchor, idx):
         assert task[1] in optimizer.state, f"State {task[1]} not found in optimizer"
         state = optimizer.state[task[1]]
         move_key(state, task[2], offload_key_events[key])
-
-
-def _offload_opt_sync_impl(anchor, idx):
-    _offload_op_stats["syncs"] += 1
-    task = _op_task_registry[idx]
-    event = offload_key_events[_offload_event_key(task)]
-    event.synchronize()
-
-    if task[2] != "hp_param":
-        state = optimizer.state[task[1]]
-        key = task[2]
-        if key in state:
-            del state[key]
+        # move_key record_stream'd the source on copy_stream, so the allocator will not hand the
+        # block out again until the copy completes. Drop the reference right here instead of at a
+        # separately placed host-blocking sync node: waiting on the copy event from the launch
+        # thread stalled the whole kernel-submission pipeline for the duration of the drain.
+        if task[2] in state:
+            del state[task[2]]
 
 
 def _reload_opt_impl(anchor, idx):
@@ -273,7 +269,18 @@ def _reload_opt_impl(anchor, idx):
         move_back_key(state, task[2], reload_key_events[task[1]])
 
 
+# Re-armed each time the pass runs (i.e. once per compile phase) and cleared on first execution.
+_empty_cache_pending = False
+
+
 def _opt_empty_cache_impl(anchor):
+    # Emptying the cache every step forces the whole backward working set back through cudaMalloc
+    # on every iteration (measured at multiple seconds per step on a 14B model). One call after
+    # each recompile is enough to return the segments freed by offloading to the driver.
+    global _empty_cache_pending
+    if not _empty_cache_pending:
+        return
+    _empty_cache_pending = False
     get_accelerator().empty_cache()
 
 
@@ -283,7 +290,6 @@ def _offload_copy_stream_sync_impl(anchor):
 
 _OFFLOAD_OP_SPECS = [
     ("offload_opt_launch", "offload_opt_launch(Tensor anchor, int idx) -> ()", _offload_opt_launch_impl),
-    ("offload_opt_sync", "offload_opt_sync(Tensor anchor, int idx) -> ()", _offload_opt_sync_impl),
     ("reload_opt", "reload_opt(Tensor anchor, int idx) -> ()", _reload_opt_impl),
     ("opt_empty_cache", "opt_empty_cache(Tensor anchor) -> ()", _opt_empty_cache_impl),
     ("offload_copy_stream_sync", "offload_copy_stream_sync(Tensor anchor) -> ()", _offload_copy_stream_sync_impl),
@@ -341,7 +347,7 @@ total_reload_mem = 0
 def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[int, bool]],
                            profiling_results: ProfilingResult, mem_budget: float, param_manager: DSGraphParamManager,
                            bwd: bool) -> Graph:
-    global offload_task_bytes_total, reload_tasks_remaining, total_reload_mem
+    global _empty_cache_pending, offload_task_bytes_total, reload_tasks_remaining, total_reload_mem
 
     to_remove = []
     for node in graph.nodes:
@@ -436,12 +442,11 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
                 to_offload.append(task)
                 optim_size = sum([task[3] for task in offload_tasks])
 
+            # No sync/free node is inserted: the launch op drops the reference itself and
+            # record_stream makes the free completion-driven, so this loop only decides which
+            # tasks are offloaded at all.
             for task in to_offload:
-                with graph.inserting_before(node):
-                    graph.create_node('call_function',
-                                      torch.ops.dc.offload_opt_sync.default, (anchor, _register_op_task(task)), {},
-                                      name=f"offload_opt_sync_{task[0]}_{task[2]}")
-                print_r0(f"Inserting fwd offload_opt_sync_{task[0]}_{task[2]}")
+                print_r0(f"Scheduling offload of optimizer state {task[0]}_{task[2]}")
                 offload_tasks_scheduled.append(task)
 
         for node in graph.nodes:
@@ -464,6 +469,7 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
         is_last_graph = graph_id == graph_order_with_backward[0]
 
         if is_first_graph:
+            _empty_cache_pending = True
             inserted_sync = False
             for node in graph.nodes:
                 if node.op != 'placeholder' and not inserted_sync:
@@ -478,8 +484,7 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
         for node in graph.nodes:
             if node.name not in peak_mem \
                 or node.op == 'placeholder' \
-                or node.op == 'output' \
-                or "offload_opt_sync_" in node.name:
+                or node.op == 'output':
                 continue
 
             if len(reload_tasks_remaining) > 0:
