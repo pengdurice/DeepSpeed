@@ -100,44 +100,26 @@ def test_fwd_insertion_schedules_all_tasks_under_forced_budget(monkeypatch):
     assert max(names.index(n) for n in launch_names) < first_compute
 
 
-def test_fwd_insertion_offloads_only_the_deficit(monkeypatch):
-    # The fake profile peaks at 100 bytes with all 96 bytes of optimizer state resident. An
-    # 80-byte budget therefore needs only 20 bytes vacated: one 32-byte task suffices. The old
-    # arithmetic double-counted the resident states (demanding peak + optim_size <= budget) and
-    # offloaded everything whenever peak + total_opt_bytes exceeded the budget.
+def test_partial_offload_when_budget_allows_residency(monkeypatch):
+    # The for_init-first schedule profiles with every state already offloaded, so keeping tasks
+    # resident adds on top of the profiled peak: peak=100B, tasks=3x32B, budget=150B admits only
+    # 32B of residency and two tasks must stay scheduled for offload.
     _ensure_dc_ops()
-    graph = _make_fwd_graph()
-    _run_fwd_pass(monkeypatch, graph, budget_gb="8e-8")
-
-    launch_names = [n.name for n in graph.nodes if n.name.startswith("offload_opt_")]
-    assert launch_names == ["offload_opt_0_exp_avg"]
-    assert len(offload_pass.offload_tasks_scheduled) == 1
-
-
-def test_floor_profile_keeps_resident_bytes_within_budget(monkeypatch):
-    # With a floor-baseline profile (for_init offloaded everything before profiling), keeping
-    # tasks resident adds on top of the profiled peak: peak=100B, tasks=3x32B, budget=150B
-    # admits only 32B of residency, so two tasks must stay scheduled for offload.
-    _ensure_dc_ops()
-    monkeypatch.setattr(offload_pass, "_profiled_on_floor", True)
     graph = _make_fwd_graph()
     _run_fwd_pass(monkeypatch, graph, budget_gb="1.5e-7")
 
     launch_names = [n.name for n in graph.nodes if n.name.startswith("offload_opt_")]
     assert len(launch_names) == 2
-    assert offload_pass._plan_on_floor is True
-    assert offload_pass._profiled_on_floor is False
+    assert len(offload_pass.offload_tasks_scheduled) == 2
 
 
-def test_for_init_offloads_and_marks_floor(monkeypatch):
+def test_for_init_offloads_before_profiling(monkeypatch):
     calls = []
     monkeypatch.setattr(offload_pass, "offload_adam_states_sync", lambda: calls.append(1))
-    monkeypatch.setattr(offload_pass, "_profiled_on_floor", False)
 
     ret = offload_pass.offload_adam_states_for_init(None, 0, [(0, True)], None, None, 0.0, None, bwd=False)
     assert ret is None
     assert calls == [1]
-    assert offload_pass._profiled_on_floor is True
 
     ret = offload_pass.offload_adam_states_for_init(None, 0, [(0, True)], None, None, 0.0, None, bwd=True)
     assert ret is None
