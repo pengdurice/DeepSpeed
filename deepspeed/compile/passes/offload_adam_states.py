@@ -332,6 +332,7 @@ def update_max_memory(name):
 
 
 offload_tasks = []
+offload_task_bytes_total = 0
 offload_tasks_scheduled = []
 reload_tasks_remaining = []
 total_reload_mem = 0
@@ -340,7 +341,7 @@ total_reload_mem = 0
 def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[int, bool]],
                            profiling_results: ProfilingResult, mem_budget: float, param_manager: DSGraphParamManager,
                            bwd: bool) -> Graph:
-    global reload_tasks_remaining, total_reload_mem
+    global offload_task_bytes_total, reload_tasks_remaining, total_reload_mem
 
     to_remove = []
     for node in graph.nodes:
@@ -384,6 +385,7 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
             # This one-shot module state survives across compile phases; reset it so re-running
             # the pass (a later phase or a second engine.compile) does not double-append tasks.
             offload_tasks.clear()
+            offload_task_bytes_total = 0
             offload_tasks_scheduled.clear()
             _op_task_registry.clear()
             total_reload_mem = 0
@@ -410,6 +412,8 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
                 offload_tasks.append((i, (hp_param, hp_param_cpu), "hp_param",
                                       hp_param.numel() * hp_param.element_size(), hp_param.dtype))
 
+            offload_task_bytes_total = sum(task[3] for task in offload_tasks)
+
         for node in graph.nodes:
             if node.name not in peak_mem \
                     or node.op == 'placeholder' \
@@ -419,7 +423,12 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
             to_offload = []
             optim_size = sum([task[3] for task in offload_tasks])
 
-            while total_mem - peak_mem[node.name] - optim_size < 0:
+            # The forward profile is recorded before this pass runs, so its peaks already include
+            # every optimizer-state tensor as resident. Credit back the bytes scheduled for offload
+            # (freed by this node at runtime) instead of also subtracting the still-resident bytes,
+            # which double-counted the optimizer states and forced a full offload whenever
+            # peak + total_opt_bytes exceeded the budget.
+            while total_mem - (peak_mem[node.name] - (offload_task_bytes_total - optim_size)) < 0:
                 if len(offload_tasks) == 0:
                     break
 
@@ -474,6 +483,10 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
                 continue
 
             if len(reload_tasks_remaining) > 0:
+                # Unlike the forward profile, the backward profile may already reflect offloaded
+                # states (the forward profiling execution runs the offload ops and skips reloads),
+                # so no resident-bytes credit is applied here until the profiler semantics are
+                # nailed down.
                 task = reload_tasks_remaining[0]
                 next_reload_mem = task[3]
 

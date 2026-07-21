@@ -58,14 +58,14 @@ def _mem_rows(graph):
     return [(node.name, 100, 0, 100) for node in graph.nodes]
 
 
-def _run_fwd_pass(monkeypatch, graph):
+def _run_fwd_pass(monkeypatch, graph, budget_gb="0"):
     monkeypatch.setattr(offload_pass.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(offload_pass, "offload_adam_states_sync", lambda: None)
     monkeypatch.setattr(offload_pass, "reload_adam_states_sync", lambda: None)
     monkeypatch.setattr(offload_pass, "sync_reload_states", lambda: None)
     monkeypatch.setattr(offload_pass, "optimizer", _make_fake_optimizer())
-    # A zero budget forces every task to be scheduled at the first compute node.
-    monkeypatch.setenv("DS_DC_OFFLOAD_OPT_BUDGET_GB", "0")
+    # The default zero budget forces every task to be scheduled at the first compute node.
+    monkeypatch.setenv("DS_DC_OFFLOAD_OPT_BUDGET_GB", budget_gb)
     prof = SimpleNamespace(fwd_mem=_mem_rows(graph), bwd_mem=[])
     return offload_pass.offload_opt_states_inc(graph, 0, [(0, True)], {0: prof}, 0.0, None, bwd=False)
 
@@ -99,6 +99,20 @@ def test_fwd_insertion_schedules_all_tasks_under_forced_budget(monkeypatch):
     first_compute = names.index("relu")
     assert max(names.index(n) for n in launch_names) < min(names.index(n) for n in sync_names)
     assert max(names.index(n) for n in sync_names) < first_compute
+
+
+def test_fwd_insertion_offloads_only_the_deficit(monkeypatch):
+    # The fake profile peaks at 100 bytes with all 96 bytes of optimizer state resident. An
+    # 80-byte budget therefore needs only 20 bytes vacated: one 32-byte task suffices. The old
+    # arithmetic double-counted the resident states (demanding peak + optim_size <= budget) and
+    # offloaded everything whenever peak + total_opt_bytes exceeded the budget.
+    _ensure_dc_ops()
+    graph = _make_fwd_graph()
+    _run_fwd_pass(monkeypatch, graph, budget_gb="8e-8")
+
+    sync_names = [n.name for n in graph.nodes if n.name.startswith("offload_opt_sync_")]
+    assert sync_names == ["offload_opt_sync_0_exp_avg"]
+    assert len(offload_pass.offload_tasks_scheduled) == 1
 
 
 def test_pass_reruns_do_not_double_append(monkeypatch):
