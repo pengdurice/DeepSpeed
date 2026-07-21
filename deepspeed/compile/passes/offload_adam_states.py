@@ -4,6 +4,7 @@
 # DeepSpeed Team
 
 import copy
+import os
 from typing import List, Tuple
 
 import torch
@@ -11,6 +12,7 @@ from torch.fx import Graph, GraphModule
 
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.zero.offload_states import _make_offload_state_key
+from deepspeed.utils import logger
 
 try:
     from torch._subclasses.fake_tensor import unset_fake_temporarily
@@ -32,7 +34,7 @@ CONTRACT = PassContract()
 
 def print_r0(msg):
     if dist.get_rank() == 0:
-        print(msg)
+        logger.debug(msg)
 
 
 MARGIN = 0.2
@@ -96,6 +98,13 @@ def move_back_key(state, key, key_event=None):
 def move_hp_param(src_tensor, dest_buf, key_event=None):
     with get_accelerator().stream(copy_stream):
         dest_buf.copy_(src_tensor, non_blocking=True)
+        # The .data rebind drops the only reference to the GPU storage while the async copy may
+        # still be reading it; keep the allocator from recycling it until copy_stream catches up.
+        # Skip tensors already offloaded to host memory (e.g. re-offload after a profiling run,
+        # where reloads are skipped): there is no GPU storage at risk and CPU tensors do not
+        # support record_stream.
+        if src_tensor.device.type != "cpu":
+            src_tensor.record_stream(copy_stream)
         src_tensor.data = dest_buf
 
     if key_event is None:
@@ -146,7 +155,6 @@ def offload_adam_states_sync():
 def reload_adam_states_sync():
 
     with unset_fake_temporarily():
-        # print_r0("Reloading Adam states")
 
         for _, state in optimizer.state.items():
             if _make_offload_state_key("exp_avg") in state:
@@ -193,6 +201,20 @@ def sync_reload_states(event=None):
 _op_task_registry = []
 _offload_ops_lib = None
 
+# Rank-local counts of op executions. Launch/sync also run during pass-time memory profiling;
+# reloads are skipped while profiling, so "reloads" only counts real training steps. Tests use
+# these to assert the offload machinery actually ran.
+_offload_op_stats = {"launches": 0, "syncs": 0, "reloads": 0}
+
+
+def get_offload_op_stats():
+    return dict(_offload_op_stats)
+
+
+def reset_offload_op_stats():
+    for key in _offload_op_stats:
+        _offload_op_stats[key] = 0
+
 
 def _register_op_task(task) -> int:
     _op_task_registry.append(task)
@@ -208,6 +230,7 @@ def _offload_event_key(task):
 
 
 def _offload_opt_launch_impl(anchor, idx):
+    _offload_op_stats["launches"] += 1
     task = _op_task_registry[idx]
     key = _offload_event_key(task)
     if offload_key_events.get(key) is None:
@@ -222,6 +245,7 @@ def _offload_opt_launch_impl(anchor, idx):
 
 
 def _offload_opt_sync_impl(anchor, idx):
+    _offload_op_stats["syncs"] += 1
     task = _op_task_registry[idx]
     event = offload_key_events[_offload_event_key(task)]
     event.synchronize()
@@ -237,6 +261,7 @@ def _reload_opt_impl(anchor, idx):
     if nz3.is_profiling():
         return
 
+    _offload_op_stats["reloads"] += 1
     task = _op_task_registry[idx]
     if reload_key_events.get(task[1]) is None:
         reload_key_events[task[1]] = get_accelerator().Event()
@@ -307,15 +332,15 @@ def update_max_memory(name):
 
 
 offload_tasks = []
-offload_tasks_remaining = []
 offload_tasks_scheduled = []
-reload_task_remaining = []
+reload_tasks_remaining = []
 total_reload_mem = 0
 
 
 def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[int, bool]],
                            profiling_results: ProfilingResult, mem_budget: float, param_manager: DSGraphParamManager,
                            bwd: bool) -> Graph:
+    global reload_tasks_remaining, total_reload_mem
 
     to_remove = []
     for node in graph.nodes:
@@ -330,7 +355,13 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
     anchor = _find_graph_anchor(graph)
 
     accelerator = get_accelerator()
-    total_mem = accelerator.total_memory() * (1 - MARGIN)
+    budget_override = os.environ.get("DS_DC_OFFLOAD_OPT_BUDGET_GB")
+    if budget_override is not None:
+        # Test/debug hook: pretend the device has this much usable memory so task scheduling
+        # can be forced (or suppressed) independently of the hardware the run lands on.
+        total_mem = float(budget_override) * 1e9
+    else:
+        total_mem = accelerator.total_memory() * (1 - MARGIN)
     print_r0(f"offload_opt_states_inc start graph {graph_id} bwd={bwd} max_memory={max_memory} total_mem={total_mem}")
 
     mem = profiling_results[graph_id].bwd_mem if bwd else profiling_results[graph_id].fwd_mem
@@ -341,77 +372,45 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
 
     ordered_node = reversed(graph.nodes) if bwd else graph.nodes
     for node in ordered_node:
-        # print(f"Node: {node.name} mem: {mem_dict[node.name]}")
         if mem_dict[node.name] > current_peak_mem:
             current_peak_mem = mem_dict[node.name]
         peak_mem[node.name] = current_peak_mem
 
-    # fwd_max_mem = max(m[3] for m in prof.fwd_mem)
-    # bwd_max_mem = max(m[3] for m in prof.bwd_mem) if len(prof.bwd_mem) > 0 else 0
-    # peak_mem = max(peak_mem, fwd_max_mem, bwd_max_mem)
-
-    global offload_tasks_remaining, reload_tasks_remaining, offload_tasks_scheduled
-
     if not bwd:
         is_first_graph = graph_id == graph_order[0][0]
-        # print_r0(
-        #     f"offload_opt_states_inc start graph {graph_id} graph_order {graph_order} fwd is_first_graph {is_first_graph}"
-        # )
 
         # At the beginning of the first graph, we schedule offload tasks to launch all offloading
         if is_first_graph:
-            # print_r0(
-            #     f"offload_opt_states_inc fwd before reload graph {graph_id} allocated_mem={get_accelerator().memory_allocated()}"
-            # )
+            # This one-shot module state survives across compile phases; reset it so re-running
+            # the pass (a later phase or a second engine.compile) does not double-append tasks.
+            offload_tasks.clear()
+            offload_tasks_scheduled.clear()
+            _op_task_registry.clear()
+            total_reload_mem = 0
 
             with unset_fake_temporarily():
                 offload_adam_states_sync()
                 reload_adam_states_sync()
                 sync_reload_states()
 
-            reload_size = 0
-
             for i, ((k, state), hp_param, hp_param_cpu) in enumerate(
                     zip(optimizer.state.items(), optimizer.fp32_partitioned_groups_flat,
                         optimizer.hp_params_pin_buffers)):
-                # print_r0(
-                # f"Checking key for offloading {i} {k.shape} has_key {_make_offload_state_key('exp_avg') in state}")
 
                 if _make_offload_state_key("exp_avg") in state:
                     key = _make_offload_state_key("exp_avg")
-                    size = state[key].numel() * state[key].element_size()
-
-                    # if total_mem < max_memory + reload_size + size:
                     offload_tasks.append(
                         (i, k, "exp_avg", state[key].numel() * state[key].element_size(), state[key].dtype))
-                    # print_r0(
-                    #     f"Offloading task {i} exp_avg reload_size={reload_size} size={size} estimated_mem={max_memory + reload_size + size}"
-                    # )
 
                 if _make_offload_state_key("exp_avg_sq") in state:
                     key = _make_offload_state_key("exp_avg_sq")
-                    size = state[key].numel() * state[key].element_size()
-
-                    # if total_mem < max_memory + reload_size + size:
                     offload_tasks.append(
                         (i, k, "exp_avg_sq", state[key].numel() * state[key].element_size(), state[key].dtype))
-                    # print_r0(
-                    #     f"Offloading task {i} exp_avg_sq reload_size={reload_size} size={size} estimated_mem={max_memory + reload_size + size}"
-                    # )
 
-                hp_param_size = hp_param.numel() * hp_param.element_size()
-                # if total_mem < max_memory + reload_size + hp_param_size:
                 offload_tasks.append((i, (hp_param, hp_param_cpu), "hp_param",
                                       hp_param.numel() * hp_param.element_size(), hp_param.dtype))
-                # print_r0(
-                #     f"Offloading task {i} hp_param reload_size={reload_size} size={hp_param_size} estimated_mem={max_memory + reload_size + hp_param_size}"
-                # )
-
-        # print_r0(f"offload_opt_states_inc fwd graph {graph_id} allocated_mem={get_accelerator().memory_allocated()}")
 
         for node in graph.nodes:
-            # print_r0(f"checking sync node insert node: {node.name}")
-
             if node.name not in peak_mem \
                     or node.op == 'placeholder' \
                     or "offload_opt_" in node.name:
@@ -420,9 +419,6 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
             to_offload = []
             optim_size = sum([task[3] for task in offload_tasks])
 
-            # print_r0(
-            #     f" optim_size: {optim_size} total_mem: {total_mem} peak_mem: {peak_mem[node.name]} available: {total_mem - peak_mem[node.name] - optim_size} #tasks={len(offload_tasks)}"
-            # )
             while total_mem - peak_mem[node.name] - optim_size < 0:
                 if len(offload_tasks) == 0:
                     break
@@ -430,9 +426,6 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
                 task = offload_tasks.pop(0)
                 to_offload.append(task)
                 optim_size = sum([task[3] for task in offload_tasks])
-                # print_r0(
-                #     f" scheduled task {task[0]} {task[2]} {task[3]} optim_size: {optim_size} peak_mem: {peak_mem[node.name]} available: {total_mem - peak_mem[node.name] - optim_size} #tasks={len(offload_tasks)}"
-                # )
 
             for task in to_offload:
                 with graph.inserting_before(node):
@@ -443,17 +436,17 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
                 offload_tasks_scheduled.append(task)
 
         for node in graph.nodes:
-            # print(f"Node: {node.name} mem: {mem_dict[node.name]}")
             if node.op != 'placeholder':
                 print_r0(f"Inserting all offload tasks before {node.name}")
                 for task in offload_tasks_scheduled:
                     name = f"offload_opt_{task[0]}_{task[2]}"
                     with graph.inserting_before(node):
-                        graph.create_node('call_function', torch.ops.dc.offload_opt_launch.default,
-                                          (anchor, _register_op_task(task)), {}, name=name)
+                        graph.create_node('call_function',
+                                          torch.ops.dc.offload_opt_launch.default, (anchor, _register_op_task(task)),
+                                          {},
+                                          name=name)
                 break
 
-        # print_r0(f"offload_opt_states_inc finish graph {graph_id} fwd graph {graph}")
         print_r0(f"offload_opt_states_inc finish graph {graph_id}")
     else:
 
@@ -461,23 +454,18 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
         is_first_graph = graph_id == graph_order_with_backward[-1]
         is_last_graph = graph_id == graph_order_with_backward[0]
 
-        # print_r0(
-        #     f"offload_opt_states_inc bwd graph {graph_id} graph_order_with_backward {graph_order_with_backward} is_first_graph {is_first_graph} is_last_graph {is_last_graph}"
-        # )
-
         if is_first_graph:
             inserted_sync = False
             for node in graph.nodes:
                 if node.op != 'placeholder' and not inserted_sync:
-                    # print(f"Inserting offload_sync before {node.name}")
                     with graph.inserting_before(node):
-                        graph.create_node('call_function', torch.ops.dc.opt_empty_cache.default, (anchor, ), {},
+                        graph.create_node('call_function',
+                                          torch.ops.dc.opt_empty_cache.default, (anchor, ), {},
                                           name="empty_cache")
 
                     inserted_sync = True
         reload_tasks_remaining = copy.copy(offload_tasks_scheduled)
 
-        global total_reload_mem
         for node in graph.nodes:
             if node.name not in peak_mem \
                 or node.op == 'placeholder' \
@@ -497,7 +485,8 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
                     )
 
                     with graph.inserting_after(insert_pos):
-                        insert_pos = graph.create_node('call_function', torch.ops.dc.reload_opt.default,
+                        insert_pos = graph.create_node('call_function',
+                                                       torch.ops.dc.reload_opt.default,
                                                        (anchor, _register_op_task(task)), {},
                                                        name=f"reload_opt_{task[0]}_{task[2]}")
 
@@ -509,21 +498,19 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
                     task = reload_tasks_remaining[0]
                     next_reload_mem = task[3]
 
-            # prev_node = node
-
         if is_last_graph:
             for node in graph.nodes:
-                # print(f"Node: {node.name} mem: {mem_dict[node.name]}")
                 if node.op == 'output':
                     for task in reload_tasks_remaining:
                         with graph.inserting_before(node):
-                            graph.create_node('call_function', torch.ops.dc.reload_opt.default,
-                                              (anchor, _register_op_task(task)), {},
+                            graph.create_node('call_function',
+                                              torch.ops.dc.reload_opt.default, (anchor, _register_op_task(task)), {},
                                               name=f"reload_opt_{task[0]}_{task[2]}")
 
                     with graph.inserting_before(node):
-                        graph.create_node('call_function', torch.ops.dc.offload_copy_stream_sync.default, (anchor, ),
-                                          {}, name="sync_offload_copy_stream")
+                        graph.create_node('call_function',
+                                          torch.ops.dc.offload_copy_stream_sync.default, (anchor, ), {},
+                                          name="sync_offload_copy_stream")
 
         print_r0(
             f"offload_opt_states_inc graph {graph_id} graph_order {graph_order} bwd is_first_graph {is_first_graph} is_last_graph {is_last_graph}"
@@ -554,14 +541,10 @@ def insert_offload_opt_states(graph: Graph, graph_id: int, graph_order: List[Tup
 
         inserted_reload = False
         for node in graph.nodes:
-            # print(f"Node: {node.name} mem: {mem_dict[node.name]}")
             if node.op == 'output' and not inserted_reload and is_last_graph:
-                # print(f"Inserting reload_opt before {node.name}")
                 with graph.inserting_before(node):
                     graph.create_node('call_function', reload_adam_states_sync, (), {}, name="reload_opt")
                 inserted_reload = True
-
-        # add_record_max_mem_nodes(graph)
 
     else:
         is_first_graph = graph_id == graph_order[0][0]
@@ -570,9 +553,8 @@ def insert_offload_opt_states(graph: Graph, graph_id: int, graph_order: List[Tup
 
         inserted_offload = False
         for node in graph.nodes:
-            # print(f"Node: {node.name} mem: {mem_dict[node.name]}")
             if node.op != 'placeholder' and not inserted_offload and is_first_graph:
-                print(f"Inserting offload_opt before {node.name}")
+                print_r0(f"Inserting offload_opt before {node.name}")
                 with graph.inserting_before(node):
                     graph.create_node('call_function', offload_adam_states_sync, (), {}, name="offload_opt")
                 inserted_offload = True

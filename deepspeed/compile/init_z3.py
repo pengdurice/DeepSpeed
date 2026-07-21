@@ -96,15 +96,21 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
 
     schedule_source = "default" if schedule is None else "user-provided"
     if schedule is None:
+        if compile_config.offload_parameters and compile_config.offload_opt_states:
+            raise ValueError("offload_parameters and offload_opt_states cannot be enabled together; "
+                             "choose one offloading target per run.")
         schedule = []
         if (compile_config.offload_parameters):
             schedule.append((0, [zero3_compile.add_z3_gather_release, offload_parameters.offload_parameter_fwd]))
+        elif compile_config.offload_opt_states:
+            from .passes.offload_adam_states import move_opt_states
+            schedule.append((0, [zero3_compile.add_z3_gather_release]))
+            schedule.append((WARMUP, [zero3_compile.add_z3_gather_release, move_opt_states]))
         else:
-            from .passes.offload_adam_states import move_opt_states, move_opt_states_sync, init_offload_opt_states
             schedule.append((0, [zero3_compile.add_z3_gather_release]))
             schedule.append(
                 (WARMUP,
-                 [zero3_compile.add_z3_gather_release, prefetch.schedule_prefetch, selective_gather.selective_gather, move_opt_states]))
+                 [zero3_compile.add_z3_gather_release, prefetch.schedule_prefetch, selective_gather.selective_gather]))
 
     for step, passes in schedule:
         _print_rank0(f"init_z3: {schedule_source} schedule from step {step}: "
@@ -130,10 +136,6 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
 
     engine.launch_compile_passes = launch_compile_passes
 
-
-    for step, passes in schedule:
-        _print_rank0(f"second print: init_z3: {schedule_source} schedule from step {step}: "
-                     f"second print: passes={[opt_pass.__name__ for opt_pass in passes]}")
     patch_fake_tensor()
     torch._inductor.config.size_asserts = False
 
