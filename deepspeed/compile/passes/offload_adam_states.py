@@ -180,59 +180,123 @@ def sync_reload_states(event=None):
             event.wait(copy_stream)
 
 
-def make_offload_task(task):
-
-    def run_offload_task():
-        # if not nz3.is_profiling():
-        # print_r0(f"run_offload_task {task[0]} {task[2]} {task[3]} {task[4]}")
-
-        if offload_key_events.get(task[1]) is None:
-            offload_key_events[task[1]] = get_accelerator().Event()
-
-        if task[2] == "hp_param":
-            move_hp_param(task[1][0], task[1][1], offload_key_events[task[1][0]])
-        else:
-            assert task[1] in optimizer.state, f"State {task[1]} not found in optimizer"
-            state = optimizer.state[task[1]]
-            # if offload_key_events.get(task[1]) is None:
-            #     offload_key_events[task[1]] = get_accelerator().Event()
-            move_key(state, task[2], offload_key_events[task[1]])
-
-    return run_offload_task
+# The offload/reload work used to be inserted into FX graphs as Python closures.
+# That works in eager mode (FX just calls the objects) but not under inductor:
+# FxGraphCache serializes call_function targets by qualified name (a closure's
+# `<locals>` qualname is unimportable), and lowering requires a registered op
+# with a schema and a Meta kernel. The dc.* ops below carry only an int index
+# into this registry; the task tuples (which hold live tensors) never cross the
+# op boundary. The anchor tensor argument is ignored at runtime -- it exists so
+# the dispatcher and fake-tensor tracing have a tensor to route on (see the
+# "Undefined" fallback for end_backward in csrc/compile/init.cpp for what
+# happens without one).
+_op_task_registry = []
+_offload_ops_lib = None
 
 
-def make_offload_sync(task):
-
-    def run_offload_sync():
-        # if not nz3.is_profiling():
-        event = offload_key_events[task[1]]
-        event.synchronize()
-
-        if task[2] != "hp_param":
-            state = optimizer.state[task[1]]
-            key = task[2]
-            if key in state:
-                del state[key]
-        # print_r0(f"run_offload_sync {task[0]} {task[2]} alloc_mem={get_accelerator().memory_allocated()}")
-
-    return run_offload_sync
+def _register_op_task(task) -> int:
+    _op_task_registry.append(task)
+    return len(_op_task_registry) - 1
 
 
-def make_reload_task(task):
+def _offload_event_key(task):
+    # hp_param tasks carry (hp_param, pin_buffer) in task[1]; key their event on
+    # the GPU tensor so launch and sync agree (the old closure code created the
+    # event under task[1] but recorded under task[1][0], raising KeyError as
+    # soon as an hp_param task was actually launched).
+    return task[1][0] if task[2] == "hp_param" else task[1]
 
-    def run_reload_task():
-        if not nz3.is_profiling():
-            if reload_key_events.get(task[1]) is None:
-                reload_key_events[task[1]] = get_accelerator().Event()
 
-            if task[2] == "hp_param":
-                move_back_hp_param(task[1][1], task[1][0], reload_key_events[task[1]])
-            else:
-                state = optimizer.state[task[1]]
-                # print_r0(f"run_reload_task {task[0]} {task[2]} {task[3]} {task[4]}")
-                move_back_key(state, task[2], reload_key_events[task[1]])
+def _offload_opt_launch_impl(anchor, idx):
+    task = _op_task_registry[idx]
+    key = _offload_event_key(task)
+    if offload_key_events.get(key) is None:
+        offload_key_events[key] = get_accelerator().Event()
 
-    return run_reload_task
+    if task[2] == "hp_param":
+        move_hp_param(task[1][0], task[1][1], offload_key_events[key])
+    else:
+        assert task[1] in optimizer.state, f"State {task[1]} not found in optimizer"
+        state = optimizer.state[task[1]]
+        move_key(state, task[2], offload_key_events[key])
+
+
+def _offload_opt_sync_impl(anchor, idx):
+    task = _op_task_registry[idx]
+    event = offload_key_events[_offload_event_key(task)]
+    event.synchronize()
+
+    if task[2] != "hp_param":
+        state = optimizer.state[task[1]]
+        key = task[2]
+        if key in state:
+            del state[key]
+
+
+def _reload_opt_impl(anchor, idx):
+    if nz3.is_profiling():
+        return
+
+    task = _op_task_registry[idx]
+    if reload_key_events.get(task[1]) is None:
+        reload_key_events[task[1]] = get_accelerator().Event()
+
+    if task[2] == "hp_param":
+        move_back_hp_param(task[1][1], task[1][0], reload_key_events[task[1]])
+    else:
+        state = optimizer.state[task[1]]
+        move_back_key(state, task[2], reload_key_events[task[1]])
+
+
+def _opt_empty_cache_impl(anchor):
+    get_accelerator().empty_cache()
+
+
+def _offload_copy_stream_sync_impl(anchor):
+    copy_stream.synchronize()
+
+
+_OFFLOAD_OP_SPECS = [
+    ("offload_opt_launch", "offload_opt_launch(Tensor anchor, int idx) -> ()", _offload_opt_launch_impl),
+    ("offload_opt_sync", "offload_opt_sync(Tensor anchor, int idx) -> ()", _offload_opt_sync_impl),
+    ("reload_opt", "reload_opt(Tensor anchor, int idx) -> ()", _reload_opt_impl),
+    ("opt_empty_cache", "opt_empty_cache(Tensor anchor) -> ()", _opt_empty_cache_impl),
+    ("offload_copy_stream_sync", "offload_copy_stream_sync(Tensor anchor) -> ()", _offload_copy_stream_sync_impl),
+]
+
+
+def register_offload_ops():
+    global _offload_ops_lib
+    if _offload_ops_lib is not None:
+        return
+
+    # FRAGMENT extends the "dc" namespace defined by the C++ extension, so this
+    # must only run after get_deepcompile_handle() has loaded it.
+    lib = torch.library.Library("dc", "FRAGMENT")
+    for name, schema, impl in _OFFLOAD_OP_SPECS:
+        lib.define(schema)
+        lib.impl(name, impl, "CompositeExplicitAutograd")
+        lib.impl(name, lambda *args: None, "Meta")
+
+        # These ops return nothing, so FX dead code elimination (re-run by
+        # inductor's post-grad passes) would drop them unless marked impure.
+        torch.fx.node._side_effectful_functions.add(getattr(torch.ops.dc, name).default)
+
+    # The ops deregister if the library object is garbage collected.
+    _offload_ops_lib = lib
+
+
+def _find_graph_anchor(graph: Graph):
+    first_placeholder = None
+    for node in graph.nodes:
+        if node.op != 'placeholder':
+            continue
+        if first_placeholder is None:
+            first_placeholder = node
+        if isinstance(node.meta.get("val"), torch.Tensor):
+            return node
+    assert first_placeholder is not None, "graph has no placeholder to anchor offload ops on"
+    return first_placeholder
 
 
 def update_max_memory(name):
@@ -240,10 +304,6 @@ def update_max_memory(name):
     global max_memory
     mem = get_accelerator().max_memory_allocated()
     max_memory = max(max_memory, mem)
-
-
-def empty_cache():
-    get_accelerator().empty_cache()
 
 
 offload_tasks = []
@@ -265,6 +325,9 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
 
     for node in to_remove:
         graph.erase_node(node)
+
+    register_offload_ops()
+    anchor = _find_graph_anchor(graph)
 
     accelerator = get_accelerator()
     total_mem = accelerator.total_memory() * (1 - MARGIN)
@@ -374,7 +437,7 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
             for task in to_offload:
                 with graph.inserting_before(node):
                     graph.create_node('call_function',
-                                      make_offload_sync(task), (), {},
+                                      torch.ops.dc.offload_opt_sync.default, (anchor, _register_op_task(task)), {},
                                       name=f"offload_opt_sync_{task[0]}_{task[2]}")
                 print_r0(f"Inserting fwd offload_opt_sync_{task[0]}_{task[2]}")
                 offload_tasks_scheduled.append(task)
@@ -386,7 +449,8 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
                 for task in offload_tasks_scheduled:
                     name = f"offload_opt_{task[0]}_{task[2]}"
                     with graph.inserting_before(node):
-                        offload_node = graph.create_node('call_function', make_offload_task(task), (), {}, name=name)
+                        graph.create_node('call_function', torch.ops.dc.offload_opt_launch.default,
+                                          (anchor, _register_op_task(task)), {}, name=name)
                 break
 
         # print_r0(f"offload_opt_states_inc finish graph {graph_id} fwd graph {graph}")
@@ -407,7 +471,8 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
                 if node.op != 'placeholder' and not inserted_sync:
                     # print(f"Inserting offload_sync before {node.name}")
                     with graph.inserting_before(node):
-                        graph.create_node('call_function', empty_cache, (), {}, name="empty_cache")
+                        graph.create_node('call_function', torch.ops.dc.opt_empty_cache.default, (anchor, ), {},
+                                          name="empty_cache")
 
                     inserted_sync = True
         reload_tasks_remaining = copy.copy(offload_tasks_scheduled)
@@ -432,8 +497,8 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
                     )
 
                     with graph.inserting_after(insert_pos):
-                        insert_pos = graph.create_node('call_function',
-                                                       make_reload_task(task), (), {},
+                        insert_pos = graph.create_node('call_function', torch.ops.dc.reload_opt.default,
+                                                       (anchor, _register_op_task(task)), {},
                                                        name=f"reload_opt_{task[0]}_{task[2]}")
 
                     total_reload_mem += next_reload_mem
@@ -452,13 +517,13 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
                 if node.op == 'output':
                     for task in reload_tasks_remaining:
                         with graph.inserting_before(node):
-                            graph.create_node('call_function',
-                                              make_reload_task(task), (), {},
+                            graph.create_node('call_function', torch.ops.dc.reload_opt.default,
+                                              (anchor, _register_op_task(task)), {},
                                               name=f"reload_opt_{task[0]}_{task[2]}")
 
-                    sync_fn = lambda: copy_stream.synchronize()
                     with graph.inserting_before(node):
-                        graph.create_node('call_function', sync_fn, (), {}, name="sync_offload_copy_stream")
+                        graph.create_node('call_function', torch.ops.dc.offload_copy_stream_sync.default, (anchor, ),
+                                          {}, name="sync_offload_copy_stream")
 
         print_r0(
             f"offload_opt_states_inc graph {graph_id} graph_order {graph_order} bwd is_first_graph {is_first_graph} is_last_graph {is_last_graph}"
@@ -543,6 +608,7 @@ def offload_adam_states_for_init(gm: GraphModule, graph_id: int, graph_order: Li
 
 def init_offload_opt_states(adam_optimizer, _nz3):
     lazy_init()
+    register_offload_ops()
 
     global optimizer
     optimizer = adam_optimizer
