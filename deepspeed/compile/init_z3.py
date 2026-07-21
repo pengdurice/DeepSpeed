@@ -103,9 +103,13 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
         if (compile_config.offload_parameters):
             schedule.append((0, [zero3_compile.add_z3_gather_release, offload_parameters.offload_parameter_fwd]))
         elif compile_config.offload_opt_states:
-            from .passes.offload_adam_states import move_opt_states
+            from .passes.offload_adam_states import move_opt_states, offload_adam_states_for_init
             schedule.append((0, [zero3_compile.add_z3_gather_release]))
-            schedule.append((WARMUP, [zero3_compile.add_z3_gather_release, move_opt_states]))
+            # Optimizer states materialize at step 0's optimizer step, so offloading can engage at
+            # step 1. for_init empties the GPU of optimizer state before the profilers run: the
+            # plan is made against the floor, and a job that only fits with offloading never has
+            # to survive a step with every state resident alongside the activations.
+            schedule.append((1, [offload_adam_states_for_init, zero3_compile.add_z3_gather_release, move_opt_states]))
         else:
             schedule.append((0, [zero3_compile.add_z3_gather_release]))
             schedule.append(
@@ -129,9 +133,10 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
         add_pre_backward_hook(set_grad_buffer)
 
         # offloading opt states need additional setup
-        from .passes.offload_adam_states import move_opt_states, move_opt_states_sync, init_offload_opt_states
+        from .passes.offload_adam_states import (move_opt_states, move_opt_states_sync, offload_adam_states_for_init,
+                                                 init_offload_opt_states)
         for _, passes in schedule:
-            if move_opt_states in passes or move_opt_states_sync in passes:
+            if move_opt_states in passes or move_opt_states_sync in passes or offload_adam_states_for_init in passes:
                 init_offload_opt_states(optimizer, dc)
 
     engine.launch_compile_passes = launch_compile_passes

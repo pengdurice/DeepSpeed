@@ -337,6 +337,13 @@ def update_max_memory(name):
     max_memory = max(max_memory, mem)
 
 
+# Set by offload_adam_states_for_init when it empties the GPU of optimizer state before the
+# profilers run; captured per compile phase by offload_opt_states_inc so the budget check knows
+# which baseline the profile describes. (Multi-graph models may see mixed baselines across
+# graphs; the flag describes the first forward graph, which dominates the peak.)
+_profiled_on_floor = False
+_plan_on_floor = False
+
 offload_tasks = []
 offload_task_bytes_total = 0
 offload_tasks_scheduled = []
@@ -344,10 +351,21 @@ reload_tasks_remaining = []
 total_reload_mem = 0
 
 
+def _predicted_runtime_peak(profiled_peak, resident_bytes):
+    if _plan_on_floor:
+        # Floor profile: for_init emptied the GPU before profiling, so any state bytes kept
+        # resident at runtime add on top of what was measured.
+        return profiled_peak + resident_bytes
+    # Resident profile: the peak already contains every state tensor, so credit back the bytes
+    # scheduled for offload (subtracting the resident bytes as well would double-count them).
+    return profiled_peak - (offload_task_bytes_total - resident_bytes)
+
+
 def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[int, bool]],
                            profiling_results: ProfilingResult, mem_budget: float, param_manager: DSGraphParamManager,
                            bwd: bool) -> Graph:
-    global _empty_cache_pending, offload_task_bytes_total, reload_tasks_remaining, total_reload_mem
+    global _empty_cache_pending, _plan_on_floor, _profiled_on_floor
+    global offload_task_bytes_total, reload_tasks_remaining, total_reload_mem
 
     to_remove = []
     for node in graph.nodes:
@@ -396,6 +414,10 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
             _op_task_registry.clear()
             total_reload_mem = 0
 
+            # Capture the profile baseline for this phase before consuming the marker.
+            _plan_on_floor = _profiled_on_floor
+            _profiled_on_floor = False
+
             with unset_fake_temporarily():
                 offload_adam_states_sync()
                 reload_adam_states_sync()
@@ -429,12 +451,10 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
             to_offload = []
             optim_size = sum([task[3] for task in offload_tasks])
 
-            # The forward profile is recorded before this pass runs, so its peaks already include
-            # every optimizer-state tensor as resident. Credit back the bytes scheduled for offload
-            # (freed by this node at runtime) instead of also subtracting the still-resident bytes,
-            # which double-counted the optimizer states and forced a full offload whenever
-            # peak + total_opt_bytes exceeded the budget.
-            while total_mem - (peak_mem[node.name] - (offload_task_bytes_total - optim_size)) < 0:
+            # The profiled peaks were measured before this pass ran; _predicted_runtime_peak
+            # translates them into the runtime peak implied by keeping optim_size bytes resident,
+            # for whichever baseline (floor or resident) this phase's profile describes.
+            while total_mem - _predicted_runtime_peak(peak_mem[node.name], optim_size) < 0:
                 if len(offload_tasks) == 0:
                     break
 
@@ -601,8 +621,11 @@ def offload_adam_states_for_init(gm: GraphModule, graph_id: int, graph_order: Li
                                  profiling_results, create_inputs_fn, mem_budget: float,
                                  param_manager: DSGraphParamManager, bwd: bool) -> GraphModule:
     if not bwd and graph_id == graph_order[0][0]:
+        global _profiled_on_floor
         with unset_fake_temporarily():
             offload_adam_states_sync()
+        # Every profiler that runs after this pass in the same phase measures the floor.
+        _profiled_on_floor = True
     # returns None, and profiling will be skipped
 
 

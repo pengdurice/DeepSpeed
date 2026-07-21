@@ -114,6 +114,36 @@ def test_fwd_insertion_offloads_only_the_deficit(monkeypatch):
     assert len(offload_pass.offload_tasks_scheduled) == 1
 
 
+def test_floor_profile_keeps_resident_bytes_within_budget(monkeypatch):
+    # With a floor-baseline profile (for_init offloaded everything before profiling), keeping
+    # tasks resident adds on top of the profiled peak: peak=100B, tasks=3x32B, budget=150B
+    # admits only 32B of residency, so two tasks must stay scheduled for offload.
+    _ensure_dc_ops()
+    monkeypatch.setattr(offload_pass, "_profiled_on_floor", True)
+    graph = _make_fwd_graph()
+    _run_fwd_pass(monkeypatch, graph, budget_gb="1.5e-7")
+
+    launch_names = [n.name for n in graph.nodes if n.name.startswith("offload_opt_")]
+    assert len(launch_names) == 2
+    assert offload_pass._plan_on_floor is True
+    assert offload_pass._profiled_on_floor is False
+
+
+def test_for_init_offloads_and_marks_floor(monkeypatch):
+    calls = []
+    monkeypatch.setattr(offload_pass, "offload_adam_states_sync", lambda: calls.append(1))
+    monkeypatch.setattr(offload_pass, "_profiled_on_floor", False)
+
+    ret = offload_pass.offload_adam_states_for_init(None, 0, [(0, True)], None, None, 0.0, None, bwd=False)
+    assert ret is None
+    assert calls == [1]
+    assert offload_pass._profiled_on_floor is True
+
+    ret = offload_pass.offload_adam_states_for_init(None, 0, [(0, True)], None, None, 0.0, None, bwd=True)
+    assert ret is None
+    assert calls == [1]
+
+
 def test_pass_reruns_do_not_double_append(monkeypatch):
     _ensure_dc_ops()
     graph_first = _make_fwd_graph()

@@ -26,9 +26,11 @@ class CompileConfig(DeepSpeedConfigModel):
 
     offload_opt_states: bool = False
     """ Offload optimizer states (fp32 master parameters and Adam moments) to pinned host memory
-    during forward/backward and reload them for the optimizer step. Schedules the move_opt_states
-    pass in place of the default prefetch/selective-gather passes; mutually exclusive with
-    offload_parameters. """
+    during forward/backward and reload them for the optimizer step. Offloading engages at step 1
+    with the states emptied before planning, so jobs that only fit with offloading are supported;
+    the planner then keeps resident whatever the memory budget allows. Schedules the
+    move_opt_states pass in place of the default prefetch/selective-gather passes; mutually
+    exclusive with offload_parameters. """
 
     double_buffer: bool = True
     """ Turn on/off the double buffering """
