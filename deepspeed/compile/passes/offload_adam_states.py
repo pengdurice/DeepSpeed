@@ -274,9 +274,10 @@ _empty_cache_pending = False
 
 
 def _opt_empty_cache_impl(anchor):
-    # Emptying the cache every step forces the whole backward working set back through cudaMalloc
-    # on every iteration (measured at multiple seconds per step on a 14B model). One call after
-    # each recompile is enough to return the segments freed by offloading to the driver.
+    # Emptying the cache on every training step forces the backward working set back through
+    # cudaMalloc each step (measured at +28% step time on an 8xH200 14B run). One call after
+    # each recompile is enough to return the segments freed by offloading to the driver; the
+    # pass re-arms the flag whenever it runs.
     global _empty_cache_pending
     if not _empty_cache_pending:
         return
