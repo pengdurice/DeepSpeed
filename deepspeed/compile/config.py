@@ -34,6 +34,11 @@ class CompileConfig(DeepSpeedConfigModel):
     graph runs once per micro-batch, so with accumulation the full offload/reload cycle repeats
     every micro-batch instead of once per optimizer step. """
 
+    offload_opt_states_combine: bool = False
+    """ With offload_opt_states: after the offload-only phase, recompile once more at the
+    warmup step with all passes combined -- offload first (it frees the memory), then
+    prefetch and selective gather spending the freed budget. """
+
     double_buffer: bool = True
     """ Turn on/off the double buffering """
 

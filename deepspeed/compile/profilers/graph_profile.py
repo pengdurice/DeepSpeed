@@ -121,8 +121,15 @@ def _get_mem_usage_out_of_torch():
         handle = pynvml.nvmlDeviceGetHandleByIndex(current_dev_id)
         info = pynvml.nvmlDeviceGetMemoryInfo(handle)
 
-        torch_alloc = get_accelerator().memory_allocated()
-        adjust = info.used - torch_alloc
+        # Subtract everything the caching allocator holds (reserved = allocated + its
+        # free cache), not just the allocated bytes: NVML's "used" includes the whole
+        # reservation, and the free cache can be many GB right after large frees (e.g.
+        # optimizer states offloaded before profiling). Counting it here would add that
+        # cache to every profiled row as phantom non-torch usage. What remains is the
+        # CUDA context, NCCL buffers and other libraries -- and, unavoidably for NVML,
+        # any other process sharing the device.
+        torch_reserved = get_accelerator().memory_reserved()
+        adjust = max(0, info.used - torch_reserved)
     except Exception:
         # pynvml not available
         pass
@@ -147,7 +154,6 @@ class ProfilingInterpreter(Interpreter):
         self.distributed = dist.is_initialized()
         self.allgather_mem: Dict[int, int] = {}
         self.debug_log = debug_log
-        self.mem_usage_out_of_torch = 0
 
     def run(self, *args) -> Any:
         """Run the graph with profiling enabled.
@@ -163,7 +169,6 @@ class ProfilingInterpreter(Interpreter):
 
             with unset_fake_temporarily():
                 with get_accelerator().random().fork_rng(devices=[self.device]):
-                    self.mem_usage_out_of_torch = _get_mem_usage_out_of_torch()
                     return_val = super().run(*args)
         except Exception as e:
             profile_complete = False
@@ -255,8 +260,11 @@ class ProfilingInterpreter(Interpreter):
         if is_comm_op(n):
             dist.barrier()
 
-        alloc_mem = get_accelerator().memory_allocated() - alloc_mem_start + self.mem_usage_out_of_torch
-        max_memory = get_accelerator().max_memory_allocated() - max_mem_start + self.mem_usage_out_of_torch
+        # These are per-node differences; the device-wide out-of-torch usage is an
+        # absolute quantity and must not be added to them (it belongs to absolute
+        # readings like MemoryProfilingInterpreter's, where it is applied).
+        alloc_mem = get_accelerator().memory_allocated() - alloc_mem_start
+        max_memory = get_accelerator().max_memory_allocated() - max_mem_start
         tensor_size = _node_size(out)
 
         def partition_param_if_necessary(v):
@@ -326,6 +334,9 @@ class MemoryProfilingInterpreter(Interpreter):
             assert _all_real_if_tensor(args), "Inputs must be real tensors"
             self.nz3.enable_profiling(True)
             self.mem_usage_out_of_torch = _get_mem_usage_out_of_torch()
+            # Rebase so the first row's delta reflects the first node, not the
+            # out-of-torch adjustment that the absolute readings below include.
+            self.last_alloc = get_accelerator().memory_allocated() + self.mem_usage_out_of_torch
 
             with unset_fake_temporarily():
                 with get_accelerator().random().fork_rng(devices=[self.device]):

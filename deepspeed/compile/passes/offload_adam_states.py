@@ -46,6 +46,12 @@ def print_r0(msg):
 
 MARGIN = 0.2
 
+# Optional floor on how many pieces the planner offloads. The memory-necessity count
+# computed from the budget walk can raise the final number but never drops below this.
+# Extra pieces beyond necessity are the lever of the combined schedule: each one frees
+# its bytes for prefetch/selective gather to spend. None keeps budget-only planning.
+offload_piece_target = None
+
 copy_stream = None
 offload_event = None
 reload_event = None
@@ -70,6 +76,18 @@ device = None
 nz3 = None
 
 
+def set_offload_piece_target(target):
+    global offload_piece_target
+    offload_piece_target = target
+
+
+def _resolve_piece_target():
+    env_target = os.environ.get("DS_DC_OFFLOAD_PIECE_TARGET")
+    if env_target is not None:
+        return int(env_target)
+    return offload_piece_target
+
+
 def move_key(state, key, key_event=None):
     # Nothing to copy when the key is already offloaded (e.g. a second offload call in the
     # same phase); check before touching state[key] so the pinned-buffer setup cannot raise.
@@ -90,6 +108,17 @@ def move_key(state, key, key_event=None):
         offload_event.record(stream=copy_stream)
     else:
         key_event.record(stream=copy_stream)
+
+
+def _wait_for_compute_before_write(compute_stream):
+    # The caching allocator hands out blocks freed on the compute stream while that
+    # stream's last kernel may still be reading them: same-stream reuse is safe because a
+    # later kernel cannot overtake the earlier one, but a write from copy_stream can.
+    # Reload buffers come from exactly such blocks, so a reload placed mid-backward would
+    # otherwise overwrite a live activation and produce NaN losses (measured: partial
+    # offload with reloads placed at mid-graph nodes went NaN one step after the pass
+    # engaged, while runs whose reloads landed at the end of backward were unaffected).
+    copy_stream.wait_stream(compute_stream)
 
 
 def _alloc_reload_buffer(like_tensor):
@@ -113,8 +142,10 @@ def move_back_key(state, key, key_event=None):
     # compute-stream reads need no extra guard: they are ordered before the next
     # offload's D2H copy by the launch op's wait_stream, and the D2H read is protected
     # at free time by move_key's record_stream.
+    compute_stream = get_accelerator().current_stream()
     buf = _alloc_reload_buffer(state[_make_offload_state_key(key)])
     with get_accelerator().stream(copy_stream):
+        _wait_for_compute_before_write(compute_stream)
         buf.copy_(state[_make_offload_state_key(key)], non_blocking=True)
     buf.record_stream(copy_stream)
     state[key] = buf
@@ -145,8 +176,10 @@ def move_hp_param(src_tensor, dest_buf, key_event=None):
 
 def move_back_hp_param(src_tensor, dest_buf, key_event=None):
     # Same allocation/ownership discipline and safety argument as move_back_key.
+    compute_stream = get_accelerator().current_stream()
     buf = _alloc_reload_buffer(src_tensor)
     with get_accelerator().stream(copy_stream):
+        _wait_for_compute_before_write(compute_stream)
         buf.copy_(src_tensor, non_blocking=True)
     buf.record_stream(copy_stream)
     dest_buf.data = buf
@@ -499,6 +532,15 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
                 print_r0(f"Scheduling offload of optimizer state {task[0]}_{task[2]}")
                 offload_tasks_scheduled.append(task)
 
+        # Raise the count to the requested piece target. Memory necessity above can only
+        # be exceeded, never undercut: a target below it is ignored.
+        piece_target = _resolve_piece_target()
+        if piece_target is not None:
+            while len(offload_tasks_scheduled) < piece_target and len(offload_tasks) > 0:
+                task = offload_tasks.pop(0)
+                print_r0(f"Scheduling offload of optimizer state {task[0]}_{task[2]} (piece target {piece_target})")
+                offload_tasks_scheduled.append(task)
+
         # Only tasks scheduled since the last insertion get launch nodes: with graph breaks
         # this runs once per forward graph, and earlier graphs already carry the launches
         # for their share of the list.
@@ -515,6 +557,25 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
                                           name=name)
                 break
         offload_tasks_inserted = len(offload_tasks_scheduled)
+
+        # Physically offload the scheduled pieces now instead of waiting for the first
+        # runtime step: passes running after this one in the same phase (prefetch,
+        # selective gather) measure memory during compilation and must see the residency
+        # the runtime will actually have -- otherwise the freed bytes stay invisible to
+        # their budgets and the combination gains nothing. The step-1 launch ops then
+        # find the keys already gone and no-op gracefully. copy_stream is None only in
+        # unit tests that bypass init_offload_opt_states; skip there.
+        if len(offload_tasks_scheduled) > 0 and copy_stream is not None:
+            with unset_fake_temporarily():
+                for task in offload_tasks_scheduled:
+                    if task[2] == "hp_param":
+                        move_hp_param(task[1][0], task[1][1])
+                    else:
+                        state = optimizer.state[task[1]]
+                        move_key(state, task[2])
+                        if task[2] in state:
+                            del state[task[2]]
+                get_accelerator().synchronize()
 
         print_r0(f"offload_opt_states_inc finish graph {graph_id}")
     else:

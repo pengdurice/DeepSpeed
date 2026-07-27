@@ -24,17 +24,22 @@ class FakeRandom:
 
 class FakeAccelerator:
 
-    def __init__(self):
+    def __init__(self, allocated=0, reserved=0):
         self.event_count = 0
+        self.allocated = allocated
+        self.reserved = reserved
 
     def current_device(self):
         return "cpu"
 
     def memory_allocated(self):
-        return 0
+        return self.allocated
 
     def max_memory_allocated(self):
-        return 0
+        return self.allocated
+
+    def memory_reserved(self):
+        return self.reserved
 
     def reset_peak_memory_stats(self):
         return None
@@ -191,3 +196,107 @@ def test_memory_profiling_interpreter_disables_profiling_if_cleanup_fails(monkey
         interpreter.run()
 
     assert fake_handle.events == [("enable", True), ("clear", None), ("enable", False)]
+
+
+class FakePynvml:
+    """Stub of the pynvml module: one device whose memory-info 'used' is configurable."""
+
+    def __init__(self, used):
+        self._used = used
+
+    def nvmlInit(self):
+        return None
+
+    def nvmlDeviceGetHandleByIndex(self, index):
+        return index
+
+    def nvmlDeviceGetMemoryInfo(self, handle):
+
+        class Info:
+            used = self._used
+
+        return Info()
+
+
+def test_mem_usage_out_of_torch_excludes_allocator_cache(monkeypatch):
+    # NVML "used" covers everything torch RESERVED, so the free cache
+    # (reserved - allocated) must not be counted as out-of-torch usage. Here the
+    # allocator holds 30GB reserved with only 10GB allocated; the device reports
+    # 31GB used. Out-of-torch usage is the 1GB context, not 21GB.
+    GB = 1024**3
+    import sys
+    monkeypatch.setitem(sys.modules, "pynvml", FakePynvml(used=31 * GB))
+    monkeypatch.setattr(graph_profile, "get_accelerator", lambda: FakeAccelerator(allocated=10 * GB, reserved=30 * GB))
+
+    assert graph_profile._get_mem_usage_out_of_torch() == 1 * GB
+
+
+def test_profiling_interpreter_deltas_exclude_out_of_torch(monkeypatch):
+    # alloc_mem/max_mem in node meta are per-node DIFFERENCES; the absolute
+    # device-wide out-of-torch usage must not be added to them.
+    fake_handle = FakeDeepCompileHandle()
+    fake_accelerator = FakeAccelerator()
+
+    monkeypatch.setattr(graph_profile, "get_deepcompile_handle", lambda: fake_handle)
+    monkeypatch.setattr(graph_profile, "get_accelerator", lambda: fake_accelerator)
+    monkeypatch.setattr(graph_profile, "_get_mem_usage_out_of_torch", lambda: 7 * 1024**3)
+    monkeypatch.setattr(graph_profile, "is_comm_op", lambda node: False)
+    monkeypatch.setattr(graph_profile, "is_release_node", lambda node: False)
+    monkeypatch.setattr(graph_profile.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(graph_profile.dist, "get_rank", lambda: 0)
+
+    graph = Graph()
+    x = graph.placeholder("x")
+    y = graph.call_function(torch.relu, (x, ))
+    graph.output(y)
+    gm = GraphModule(torch.nn.Module(), graph)
+
+    interpreter = graph_profile.ProfilingInterpreter(gm, iteration=1, warmup=0)
+    interpreter.run(torch.ones(1))
+
+    call_node = next(node for node in gm.graph.nodes if node.op == "call_function")
+    # The fake accelerator reports constant memory, so the true deltas are zero.
+    assert call_node.meta["alloc_mem"] == 0
+    assert call_node.meta["max_mem"] == 0
+
+
+def test_memory_profiling_first_delta_excludes_out_of_torch(monkeypatch):
+    # Rows report absolute usage including the out-of-torch adjustment; the first
+    # row's delta must reflect the first node, not the adjustment itself.
+    fake_handle = FakeDeepCompileHandle()
+    fake_accelerator = FakeAccelerator(allocated=500)
+
+    class FakeDist:
+
+        @staticmethod
+        def all_reduce(tensor, op=None):
+            return None
+
+        @staticmethod
+        def is_initialized():
+            return True
+
+        @staticmethod
+        def get_rank():
+            return 0
+
+        ReduceOp = graph_profile.dist.ReduceOp
+
+    monkeypatch.setattr(graph_profile, "get_deepcompile_handle", lambda: fake_handle)
+    monkeypatch.setattr(graph_profile, "get_accelerator", lambda: fake_accelerator)
+    monkeypatch.setattr(graph_profile, "_all_real_if_tensor", lambda args: True)
+    monkeypatch.setattr(graph_profile, "_get_mem_usage_out_of_torch", lambda: 1000)
+    monkeypatch.setattr(graph_profile, "dist", FakeDist())
+
+    graph = Graph()
+    x = graph.placeholder("x")
+    graph.output(x)
+    gm = GraphModule(torch.nn.Module(), graph)
+
+    interpreter = graph_profile.MemoryProfilingInterpreter(gm)
+    interpreter.run(torch.ones(1))
+
+    assert len(interpreter.mem_record) >= 1
+    first_name, first_alloc, first_delta, _ = interpreter.mem_record[0]
+    assert first_alloc == 1500  # absolute reading includes the adjustment
+    assert first_delta == 0  # nothing was allocated by the node itself

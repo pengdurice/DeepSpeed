@@ -35,6 +35,7 @@ def _reset_offload_pass_globals():
     offload_pass.total_reload_mem = 0
     offload_pass._op_task_registry.clear()
     offload_pass._empty_cache_pending = False
+    offload_pass.set_offload_piece_target(None)
     offload_pass.reset_offload_op_stats()
 
 
@@ -175,6 +176,40 @@ def test_fwd_insertion_schedules_all_tasks_under_forced_budget(monkeypatch):
     assert max(names.index(n) for n in launch_names) < first_compute
 
 
+def test_piece_target_raises_scheduled_count(monkeypatch):
+    # A generous budget schedules nothing by necessity; the piece target raises the count
+    # so the freed bytes become budget for the passes that run after this one.
+    _ensure_dc_ops()
+    graph = _make_fwd_graph()
+    monkeypatch.setenv("DS_DC_OFFLOAD_PIECE_TARGET", "2")
+    _run_fwd_pass(monkeypatch, graph, budget_gb="1")
+
+    launch_names = [n.name for n in graph.nodes if n.name.startswith("offload_opt_")]
+    assert len(launch_names) == 2
+    assert len(offload_pass.offload_tasks_scheduled) == 2
+
+
+def test_piece_target_cannot_undercut_memory_necessity(monkeypatch):
+    # A zero budget forces all three pieces out; a smaller target must not reduce that.
+    _ensure_dc_ops()
+    graph = _make_fwd_graph()
+    monkeypatch.setenv("DS_DC_OFFLOAD_PIECE_TARGET", "1")
+    _run_fwd_pass(monkeypatch, graph, budget_gb="0")
+
+    launch_names = [n.name for n in graph.nodes if n.name.startswith("offload_opt_")]
+    assert len(launch_names) == 3
+
+
+def test_piece_target_setter_used_when_env_absent(monkeypatch):
+    _ensure_dc_ops()
+    graph = _make_fwd_graph()
+    offload_pass.set_offload_piece_target(2)
+    _run_fwd_pass(monkeypatch, graph, budget_gb="1")
+
+    launch_names = [n.name for n in graph.nodes if n.name.startswith("offload_opt_")]
+    assert len(launch_names) == 2
+
+
 def test_partial_offload_when_budget_allows_residency(monkeypatch):
     # The for_init-first schedule profiles with every state already offloaded, so keeping tasks
     # resident adds on top of the profiled peak: peak=100B, tasks=3x32B, budget=150B admits only
@@ -257,8 +292,12 @@ class TestOffloadOptStates(DistributedTest):
     world_size = 2
     non_daemonic_procs = True
 
+    # forced=True offloads every piece (reloads land at the end of backward); piece_target
+    # offloads a subset with memory to spare, which places reloads MID-backward -- the case
+    # that exposed a cross-stream write into a live activation (NaN losses).
     @pytest.mark.parametrize('dtype', [torch.bfloat16])
-    def test_offload_opt_states_correctness(self, dtype):
+    @pytest.mark.parametrize('mode', ['forced_full', 'piece_target'])
+    def test_offload_opt_states_correctness(self, dtype, mode):
         from deepspeed.compile.util import is_deepcompile_supported
 
         skip_on_arch(min_arch=8)
@@ -302,7 +341,13 @@ class TestOffloadOptStates(DistributedTest):
 
         # Force every optimizer-state tensor to be scheduled for offload (including hp_param,
         # which covers the event-key regression) regardless of the device's actual memory.
-        os.environ["DS_DC_OFFLOAD_OPT_BUDGET_GB"] = "0.000001"
+        if mode == 'forced_full':
+            os.environ["DS_DC_OFFLOAD_OPT_BUDGET_GB"] = "0.000001"
+        else:
+            # Plenty of budget, so nothing is offloaded out of necessity: the piece target
+            # alone schedules pieces and the planner places their reloads early.
+            os.environ["DS_DC_OFFLOAD_OPT_BUDGET_GB"] = "1000"
+            os.environ["DS_DC_OFFLOAD_PIECE_TARGET"] = "2"
         try:
             offload_pass.reset_offload_op_stats()
             # The offload schedule engages at step 1 (not WARMUP); 8 iterations give several
@@ -310,6 +355,7 @@ class TestOffloadOptStates(DistributedTest):
             losses_offload = compare_loss(self, config, dtype, iteration=8)
         finally:
             del os.environ["DS_DC_OFFLOAD_OPT_BUDGET_GB"]
+            os.environ.pop("DS_DC_OFFLOAD_PIECE_TARGET", None)
 
         stats = offload_pass.get_offload_op_stats()
         assert stats["launches"] > 0, "offload launch ops never executed"

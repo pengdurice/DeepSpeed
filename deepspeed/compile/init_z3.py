@@ -90,6 +90,13 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
             # plan is made against the floor, and a job that only fits with offloading never has
             # to survive a step with every state resident alongside the activations.
             schedule.append((1, [offload_adam_states_for_init, zero3_compile.add_z3_gather_release, move_opt_states]))
+            if compile_config.offload_opt_states_combine:
+                # Combined phase: offload plans (and physically moves) first so prefetch and
+                # selective gather compile against the freed memory, then spend it.
+                schedule.append((WARMUP, [
+                    offload_adam_states_for_init, zero3_compile.add_z3_gather_release, move_opt_states,
+                    prefetch.schedule_prefetch, selective_gather.selective_gather
+                ]))
         else:
             schedule.append((0, [zero3_compile.add_z3_gather_release]))
             schedule.append(
