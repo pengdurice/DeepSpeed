@@ -3,6 +3,8 @@
 
 # DeepSpeed Team
 
+import os
+
 import torch
 
 from deepspeed import comm as dist
@@ -93,10 +95,18 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
             if compile_config.offload_opt_states_combine:
                 # Combined phase: offload plans (and physically moves) first so prefetch and
                 # selective gather compile against the freed memory, then spend it.
-                schedule.append((WARMUP, [
+                combined = [
                     offload_adam_states_for_init, zero3_compile.add_z3_gather_release, move_opt_states,
                     prefetch.schedule_prefetch, selective_gather.selective_gather
-                ]))
+                ]
+                # Experiment hook: run the offload planner a second time, after the gather
+                # passes have spent their budget. Its first pass plans reload positions and
+                # the piece count against peaks measured BEFORE those passes raise them; the
+                # second pass sees the final memory picture. One iteration of the fixed-point
+                # the three passes really form.
+                if os.environ.get("DS_DC_COMBINE_REPLAN") == "1":
+                    combined.append(move_opt_states)
+                schedule.append((WARMUP, combined))
         else:
             schedule.append((0, [zero3_compile.add_z3_gather_release]))
             schedule.append(
