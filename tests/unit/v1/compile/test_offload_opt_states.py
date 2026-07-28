@@ -71,12 +71,25 @@ def _make_fwd_graph():
     return graph
 
 
+class _null_context:
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *args):
+        return False
+
+
 def _mem_rows(graph):
     return [(node.name, 100, 0, 100) for node in graph.nodes]
 
 
-def _run_fwd_pass(monkeypatch, graph, budget_gb="0"):
+def _run_fwd_pass(monkeypatch, graph, budget_gb="0", moved=None):
     monkeypatch.setattr(offload_pass.dist, "get_rank", lambda: 0)
+    # The pass physically offloads the pieces it schedules; these tests exercise the
+    # planner, not the copies, so record the calls instead of running them.
+    monkeypatch.setattr(offload_pass, "_offload_task", lambda task: (moved if moved is not None else []).append(task))
+    monkeypatch.setattr(offload_pass, "unset_fake_temporarily", _null_context)
     monkeypatch.setattr(offload_pass, "offload_adam_states_sync", lambda: None)
     monkeypatch.setattr(offload_pass, "reload_adam_states_sync", lambda: None)
     monkeypatch.setattr(offload_pass, "sync_reload_states", lambda: None)
@@ -210,6 +223,19 @@ def test_piece_target_setter_used_when_env_absent(monkeypatch):
     assert len(launch_names) == 2
 
 
+def test_scheduled_pieces_are_offloaded_at_planning_time(monkeypatch):
+    # Passes that run after this one in the same phase (prefetch, selective gather) profile
+    # memory during compilation, so the pieces must be off the device by the time the pass
+    # returns -- not only when the graph first executes.
+    _ensure_dc_ops()
+    graph = _make_fwd_graph()
+    moved = []
+    _run_fwd_pass(monkeypatch, graph, moved=moved)
+
+    assert len(moved) == 3
+    assert [task[2] for task in moved] == ["exp_avg", "exp_avg_sq", "hp_param"]
+
+
 def test_partial_offload_when_budget_allows_residency(monkeypatch):
     # The for_init-first schedule profiles with every state already offloaded, so keeping tasks
     # resident adds on top of the profiled peak: peak=100B, tasks=3x32B, budget=150B admits only
@@ -296,7 +322,7 @@ class TestOffloadOptStates(DistributedTest):
     # offloads a subset with memory to spare, which places reloads MID-backward -- the case
     # that exposed a cross-stream write into a live activation (NaN losses).
     @pytest.mark.parametrize('dtype', [torch.bfloat16])
-    @pytest.mark.parametrize('mode', ['forced_full', 'piece_target'])
+    @pytest.mark.parametrize('mode', ['forced_full', 'piece_target', 'combined'])
     def test_offload_opt_states_correctness(self, dtype, mode):
         from deepspeed.compile.util import is_deepcompile_supported
 
@@ -310,6 +336,10 @@ class TestOffloadOptStates(DistributedTest):
         if not is_deepcompile_supported():
             pytest.skip("DeepCompile is not supported in this environment")
 
+        # 'combined' adds prefetch and selective gather on top of the offload pass in one
+        # phase: prefetch rewrites the graph after the offload/reload/sync nodes are in it
+        # and selective gather then pins parameters resident. That rewrite interaction is
+        # the highest-risk path in the combined schedule, so it gets its own loss check.
         config = {
             "train_micro_batch_size_per_gpu": 1,
             "steps_per_print": 1,
@@ -324,7 +354,8 @@ class TestOffloadOptStates(DistributedTest):
             },
             "compile": {
                 "deepcompile": True,
-                "offload_opt_states": True
+                "offload_opt_states": True,
+                "offload_opt_states_combine": mode == 'combined'
             },
             "bf16": {
                 "enabled": True
@@ -341,7 +372,7 @@ class TestOffloadOptStates(DistributedTest):
 
         # Force every optimizer-state tensor to be scheduled for offload (including hp_param,
         # which covers the event-key regression) regardless of the device's actual memory.
-        if mode == 'forced_full':
+        if mode in ('forced_full', 'combined'):
             os.environ["DS_DC_OFFLOAD_OPT_BUDGET_GB"] = "0.000001"
         else:
             # Plenty of budget, so nothing is offloaded out of necessity: the piece target
@@ -350,8 +381,8 @@ class TestOffloadOptStates(DistributedTest):
             os.environ["DS_DC_OFFLOAD_PIECE_TARGET"] = "2"
         try:
             offload_pass.reset_offload_op_stats()
-            # The offload schedule engages at step 1 (not WARMUP); 8 iterations give several
-            # steady offloaded steps.
+            # The offload schedule engages at step 1; the combined phase is added at WARMUP
+            # (5), so run past it to exercise the recompiled graph.
             losses_offload = compare_loss(self, config, dtype, iteration=8)
         finally:
             del os.environ["DS_DC_OFFLOAD_OPT_BUDGET_GB"]

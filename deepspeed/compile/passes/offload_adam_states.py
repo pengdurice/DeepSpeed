@@ -289,24 +289,29 @@ def _register_op_task(task) -> int:
     return len(_op_task_registry) - 1
 
 
+def _offload_task(task):
+    """Move one optimizer-state piece to host memory. Shared by the graph op and by the
+    pass, which offloads at planning time so later passes profile the real residency."""
+    if task[2] == "hp_param":
+        move_hp_param(task[1][0], task[1][1])
+        return
+    assert task[1] in optimizer.state, f"State {task[1]} not found in optimizer"
+    state = optimizer.state[task[1]]
+    move_key(state, task[2])
+    # move_key record_stream'd the source on copy_stream, so the allocator will not hand the
+    # block out again until the copy completes. Drop the reference right here instead of at a
+    # separately placed host-blocking sync node: waiting on the copy event from the launch
+    # thread stalled the whole kernel-submission pipeline for the duration of the drain.
+    if task[2] in state:
+        del state[task[2]]
+
+
 def _offload_opt_launch_impl(anchor, idx):
     _offload_op_stats["launches"] += 1
-    task = _op_task_registry[idx]
     # The states were last written by the optimizer step on the compute stream; make the
     # D2H reads wait for those writes. Stream-level dependency only, no host wait.
     copy_stream.wait_stream(get_accelerator().current_stream())
-    if task[2] == "hp_param":
-        move_hp_param(task[1][0], task[1][1])
-    else:
-        assert task[1] in optimizer.state, f"State {task[1]} not found in optimizer"
-        state = optimizer.state[task[1]]
-        move_key(state, task[2])
-        # move_key record_stream'd the source on copy_stream, so the allocator will not hand the
-        # block out again until the copy completes. Drop the reference right here instead of at a
-        # separately placed host-blocking sync node: waiting on the copy event from the launch
-        # thread stalled the whole kernel-submission pipeline for the duration of the drain.
-        if task[2] in state:
-            del state[task[2]]
+    _offload_task(_op_task_registry[idx])
 
 
 def _reload_opt_impl(anchor, idx):
@@ -559,22 +564,16 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
         offload_tasks_inserted = len(offload_tasks_scheduled)
 
         # Physically offload the scheduled pieces now instead of waiting for the first
-        # runtime step: passes running after this one in the same phase (prefetch,
-        # selective gather) measure memory during compilation and must see the residency
-        # the runtime will actually have -- otherwise the freed bytes stay invisible to
-        # their budgets and the combination gains nothing. The step-1 launch ops then
-        # find the keys already gone and no-op gracefully. copy_stream is None only in
-        # unit tests that bypass init_offload_opt_states; skip there.
-        if len(offload_tasks_scheduled) > 0 and copy_stream is not None:
+        # runtime step. Any pass that runs after this one in the same phase (prefetch,
+        # selective gather) profiles memory during compilation, and its budget must be
+        # computed against the residency the runtime will really have. The launch ops
+        # inserted above then find the keys already gone and no-op on the first step.
+        # This applies to every schedule containing the pass, not only the combined one:
+        # it also makes the offload-only phase's own post-pass profile match the runtime.
+        if is_first_graph and len(offload_tasks_scheduled) > 0:
             with unset_fake_temporarily():
                 for task in offload_tasks_scheduled:
-                    if task[2] == "hp_param":
-                        move_hp_param(task[1][0], task[1][1])
-                    else:
-                        state = optimizer.state[task[1]]
-                        move_key(state, task[2])
-                        if task[2] in state:
-                            del state[task[2]]
+                    _offload_task(task)
                 get_accelerator().synchronize()
 
         print_r0(f"offload_opt_states_inc finish graph {graph_id}")
