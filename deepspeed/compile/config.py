@@ -34,6 +34,14 @@ class CompileConfig(DeepSpeedConfigModel):
     graph runs once per micro-batch, so with accumulation the full offload/reload cycle repeats
     every micro-batch instead of once per optimizer step. """
 
+    offload_opt_states_tune: bool = False
+    """ With offload_opt_states_combine: after each compile phase, measure real step times and
+    try one more offloaded piece, keeping the fastest configuration seen. Also offloads more when
+    a phase's peak exceeds the memory budget the plan assumed. Costs one recompile per round. """
+
+    offload_opt_states_tune_rounds: int = 3
+    """ Maximum tuning rounds (recompiles) for offload_opt_states_tune. """
+
     offload_opt_states_combine: bool = False
     """ With offload_opt_states: after the offload-only phase, recompile once more at the
     warmup step with all passes combined -- offload first (it frees the memory), then

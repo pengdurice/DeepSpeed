@@ -36,6 +36,7 @@ def _reset_offload_pass_globals():
     offload_pass._op_task_registry.clear()
     offload_pass._empty_cache_pending = False
     offload_pass.set_offload_piece_target(None)
+    offload_pass.set_offload_piece_cap(None)
     offload_pass.reset_offload_op_stats()
 
 
@@ -234,6 +235,27 @@ def test_scheduled_pieces_are_offloaded_at_planning_time(monkeypatch):
 
     assert len(moved) == 3
     assert [task[2] for task in moved] == ["exp_avg", "exp_avg_sq", "hp_param"]
+
+
+def test_piece_cap_holds_the_count_below_what_the_budget_asks(monkeypatch):
+    # A zero budget would offload all three pieces. The cap is set only when the tuner reverts to
+    # a count this run already executed, so it must win over the estimate.
+    _ensure_dc_ops()
+    graph = _make_fwd_graph()
+    monkeypatch.setenv("DS_DC_OFFLOAD_PIECE_CAP", "1")
+    _run_fwd_pass(monkeypatch, graph, budget_gb="0")
+
+    assert len([n for n in graph.nodes if n.name.startswith("offload_opt_")]) == 1
+
+
+def test_piece_cap_also_limits_the_target(monkeypatch):
+    _ensure_dc_ops()
+    graph = _make_fwd_graph()
+    monkeypatch.setenv("DS_DC_OFFLOAD_PIECE_TARGET", "3")
+    monkeypatch.setenv("DS_DC_OFFLOAD_PIECE_CAP", "2")
+    _run_fwd_pass(monkeypatch, graph, budget_gb="1")
+
+    assert len([n for n in graph.nodes if n.name.startswith("offload_opt_")]) == 2
 
 
 def test_partial_offload_when_budget_allows_residency(monkeypatch):

@@ -39,6 +39,12 @@ next_pass_step = -1
 next_passes = None
 current_passes = None
 
+# Set by init_z3 when offload tuning is on: the controller, the pass list to recompile with,
+# and the time of the previous step (the tuner measures the gaps between phase launches).
+offload_tuner = None
+offload_tuner_passes = None
+_last_step_time = None
+
 param_manager: Dict[int, DSGraphParamManager] = {}
 
 
@@ -97,6 +103,35 @@ def init_schedule(schedule):
     remaining_schedule = deque(schedule)
 
 
+def init_offload_tuner(tuner, passes):
+    global offload_tuner, offload_tuner_passes
+    offload_tuner = tuner
+    offload_tuner_passes = passes
+
+
+def _tune_offload_pieces(global_steps: int):
+    """Measure this step and, when the tuner asks for a different piece count, queue a phase."""
+    global _last_step_time
+
+    from .passes.offload_adam_states import (offload_tasks_scheduled, set_offload_piece_cap, set_offload_piece_target)
+
+    now = time.time()
+    previous, _last_step_time = _last_step_time, now
+    if previous is None or offload_tuner.done:
+        return
+
+    pieces = len(offload_tasks_scheduled)
+    peak = get_accelerator().max_memory_allocated()
+    next_pieces = offload_tuner.observe(pieces, now - previous, peak)
+    if next_pieces is not None:
+        set_offload_piece_target(next_pieces)
+        # A settled tuner is reverting to a count this run already executed, so it is known to
+        # fit: pin it exactly. While still exploring, only raise the floor and leave the planner
+        # free to schedule more if the budget says it must.
+        set_offload_piece_cap(next_pieces if offload_tuner.done else None)
+        remaining_schedule.append((global_steps + 1, offload_tuner_passes))
+
+
 def launch_compile_passes(global_steps: int):
     global next_pass_step, next_passes
 
@@ -110,6 +145,9 @@ def launch_compile_passes(global_steps: int):
         profiling_results.clear()
         param_manager.clear()
         frames_partitioned.clear()
+
+    if offload_tuner is not None:
+        _tune_offload_pieces(global_steps)
 
 
 def set_time_and_tensor_size(graph_id, graph: Graph, mem, bwd, profiling_results, mem_complete=True):

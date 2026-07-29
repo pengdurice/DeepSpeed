@@ -45,12 +45,21 @@ def print_r0(msg):
 
 
 MARGIN = 0.2
+# Host-to-device bandwidth per rank when all ranks copy at once, used to decide how early the
+# reloads must start. Measured 27.9 GB/s on H200; the conservative value starts them a little
+# sooner, which costs a little memory and never costs time.
+RELOAD_BANDWIDTH_BYTES_PER_SEC = 20e9
 
 # Optional floor on how many pieces the planner offloads. The memory-necessity count
 # computed from the budget walk can raise the final number but never drops below this.
 # Extra pieces beyond necessity are the lever of the combined schedule: each one frees
 # its bytes for prefetch/selective gather to spend. None keeps budget-only planning.
 offload_piece_target = None
+# Hard cap on the piece count, set only when the tuner reverts to a configuration this run has
+# already executed. The budget walk's estimate can drift upward between recompiles (selective
+# gather's persistent parameters raise the floor), and an estimate must not override a count
+# that was observed running.
+offload_piece_cap = None
 
 copy_stream = None
 offload_event = None
@@ -79,6 +88,18 @@ nz3 = None
 def set_offload_piece_target(target):
     global offload_piece_target
     offload_piece_target = target
+
+
+def set_offload_piece_cap(cap):
+    global offload_piece_cap
+    offload_piece_cap = cap
+
+
+def _resolve_piece_cap():
+    env_cap = os.environ.get("DS_DC_OFFLOAD_PIECE_CAP")
+    if env_cap is not None:
+        return int(env_cap)
+    return offload_piece_cap
 
 
 def _resolve_piece_target():
@@ -410,6 +431,21 @@ def register_offload_ops():
     _offload_ops_lib = lib
 
 
+def _reload_copy_time_ms(tasks):
+    return sum(task[3] for task in tasks) / RELOAD_BANDWIDTH_BYTES_PER_SEC * 1000
+
+
+def _remaining_device_time_ms(graph: Graph, node_time):
+    """For each node, how much compute time is left between it and the end of the graph."""
+    per_node = {name: device_time for name, device_time, _ in node_time}
+    remaining = {}
+    total = 0.0
+    for node in reversed(list(graph.nodes)):
+        remaining[node.name] = total
+        total += per_node.get(node.name, 0.0)
+    return remaining
+
+
 def _find_graph_anchor(graph: Graph):
     for node in graph.nodes:
         if node.op == 'placeholder' and isinstance(node.meta.get("val"), torch.Tensor):
@@ -519,11 +555,14 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
 
             to_offload = []
             optim_size = sum([task[3] for task in offload_tasks])
+            piece_cap = _resolve_piece_cap()
 
             # The peaks were profiled after offload_adam_states_for_init emptied the GPU of
             # optimizer state, so keeping optim_size bytes resident adds on top of them.
             while total_mem - peak_mem[node.name] - optim_size < 0:
                 if len(offload_tasks) == 0:
+                    break
+                if piece_cap is not None and len(offload_tasks_scheduled) + len(to_offload) >= piece_cap:
                     break
 
                 task = offload_tasks.pop(0)
@@ -540,6 +579,9 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
         # Raise the count to the requested piece target. Memory necessity above can only
         # be exceeded, never undercut: a target below it is ignored.
         piece_target = _resolve_piece_target()
+        piece_cap = _resolve_piece_cap()
+        if piece_cap is not None and piece_target is not None:
+            piece_target = min(piece_target, piece_cap)
         if piece_target is not None:
             while len(offload_tasks_scheduled) < piece_target and len(offload_tasks) > 0:
                 task = offload_tasks.pop(0)
@@ -599,6 +641,8 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
             # each graph reloads its share and later graphs continue from the remainder.
             reload_tasks_remaining = copy.copy(offload_tasks_scheduled)
 
+        remaining_time_ms = _remaining_device_time_ms(graph, profiling_results[graph_id].bwd_time)
+
         # DS_DC_RELOAD_EARLY=1 queues every reload at the start of backward instead of using the
         # budget-driven placement, giving the transfers the whole backward to hide under. Used to
         # separate structural exposure (placement) from irreducible transfer cost in experiments;
@@ -625,7 +669,13 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
                 next_reload_mem = task[3]
 
                 insert_pos = node
-                while total_mem > peak_mem[node.name] + total_reload_mem + next_reload_mem:
+                # Reload here if memory allows, or if waiting any longer would leave the copies
+                # unfinished when the graph ends. Placing them as early as memory allows spends
+                # the whole headroom and raised the peak 107 -> 123 GB at sequence 2400, which
+                # cost more in allocator stalls than the exposure it removed; the deadline uses
+                # only the time actually needed to hide the copy.
+                past_deadline = remaining_time_ms.get(node.name, 0.0) <= _reload_copy_time_ms(reload_tasks_remaining)
+                while past_deadline or total_mem > peak_mem[node.name] + total_reload_mem + next_reload_mem:
                     expected_mem = peak_mem[node.name] + total_reload_mem
                     print_r0(
                         f" Inserting reload_opt reload_opt_{task[0]}_{task[2]} after {insert_pos.name} next_inc={next_reload_mem} peak_mem[{node.name}]={peak_mem[node.name]} inc_total={total_reload_mem} expected_mem={expected_mem}"

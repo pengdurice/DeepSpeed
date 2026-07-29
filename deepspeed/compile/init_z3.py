@@ -107,6 +107,21 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
                 if os.environ.get("DS_DC_COMBINE_REPLAN") == "1":
                     combined.append(move_opt_states)
                 schedule.append((WARMUP, combined))
+                if compile_config.offload_opt_states_tune:
+                    from .backend import init_offload_tuner
+                    from .offload_tuner import OffloadTuner
+                    from .passes.offload_adam_states import MARGIN
+                    # Tuning rounds rerun every pass EXCEPT selective gather: set_persistent()
+                    # has no release path (invalidate_gathered_param and clear_all_gathered_params
+                    # both skip persistent params), so running the pass again only ever adds more
+                    # resident parameters. That raises the memory floor each round, which raises
+                    # the piece count the offload planner must schedule, and the tuner can never
+                    # return to a smaller count. Persisting what the first combined phase chose
+                    # keeps every round comparable and leaves the piece count as the only variable.
+                    tune_passes = [p for p in combined if p is not selective_gather.selective_gather]
+                    budget = get_accelerator().total_memory() * (1 - MARGIN)
+                    init_offload_tuner(OffloadTuner(compile_config.offload_opt_states_tune_rounds, budget),
+                                       tune_passes)
         else:
             schedule.append((0, [zero3_compile.add_z3_gather_release]))
             schedule.append(
