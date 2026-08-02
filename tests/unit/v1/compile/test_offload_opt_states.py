@@ -38,11 +38,8 @@ def _reset_offload_pass_globals():
 
 
 def _ensure_dc_ops():
-    # Load the C++ library first so the FRAGMENT extends it as it does in production.
-    from deepspeed.compile.util import is_deepcompile_supported
-    if is_deepcompile_supported():
-        from deepspeed.compile.util import get_deepcompile_handle
-        get_deepcompile_handle()
+    # Registration only needs torch.library, so these tests run the same way with or without the
+    # compiled extension present.
     offload_pass.register_offload_ops()
 
 

@@ -295,28 +295,32 @@ _OFFLOAD_OP_SPECS = [
 
 def register_offload_ops():
     global _offload_ops_lib
-    if _offload_ops_lib is not None:
-        return
+    if _offload_ops_lib is None:
+        # FRAGMENT, not DEF: the compiled extension creates the "dc" namespace with TORCH_LIBRARY,
+        # and a namespace may only be created once per process. A FRAGMENT extends the namespace
+        # without claiming it, and none of the names below are also defined by the extension, so
+        # the two can be set up in either order.
+        lib = torch.library.Library("dc", "FRAGMENT")
+        for name, schema, impl in _OFFLOAD_OP_SPECS:
+            lib.define(schema)
+            lib.impl(name, impl, "CompositeExplicitAutograd")
+            lib.impl(name, lambda *args: None, "Meta")
+        # The ops deregister if the library object is garbage collected.
+        _offload_ops_lib = lib
 
-    # FRAGMENT extends the C++ extension's "dc" namespace, so it must be loaded first.
-    lib = torch.library.Library("dc", "FRAGMENT")
-    for name, schema, impl in _OFFLOAD_OP_SPECS:
-        lib.define(schema)
-        lib.impl(name, impl, "CompositeExplicitAutograd")
-        lib.impl(name, lambda *args: None, "Meta")
+    # Marking runs on every call, not only the first. Nothing consumes these ops' output, so two
+    # dead-code eliminations would drop them: FX's, guarded by _side_effectful_functions, and
+    # inductor's scheduler DCE, which keys off the schema instead. The ORDERED effect covers the
+    # second and pins the ops in program order, which reload-before-sync depends on. That effect
+    # lives in a weak-keyed registry attached to the overload object, so anything that rebuilds
+    # the "dc" namespace silently drops it; re-marking here repairs that before each compile.
+    for name, _, _ in _OFFLOAD_OP_SPECS:
         overload = getattr(torch.ops.dc, name).default
-
-        # Nothing consumes these ops' output, so two dead-code eliminations would drop them:
-        # FX's, guarded by _side_effectful_functions, and inductor's scheduler DCE, which keys
-        # off the schema instead. The ORDERED effect covers the second and also pins the ops in
-        # program order, which reload-before-sync depends on.
         torch.fx.node._side_effectful_functions.add(overload)
-        _registered_overloads.append(overload)
+        if overload not in _registered_overloads:
+            _registered_overloads.append(overload)
         if _register_effectful_op is not None:
             _register_effectful_op(overload, _EffectType.ORDERED)
-
-    # The ops deregister if the library object is garbage collected.
-    _offload_ops_lib = lib
 
 
 def _find_graph_anchor(graph: Graph):
