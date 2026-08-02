@@ -92,15 +92,25 @@ def test_register_offload_ops_idempotent():
         assert overload in torch.fx.node._side_effectful_functions
 
 
+def _registered_effect(overload):
+    # torch moved this registry: up to 2.7 it is a SIDE_EFFECTS dict, and later versions expose a
+    # _get_effect accessor backed by the library registry instead.
+    from torch._higher_order_ops import effects
+
+    if hasattr(effects, "_get_effect"):
+        return effects._get_effect(overload)
+    return effects.SIDE_EFFECTS.get(overload)
+
+
 def test_offload_ops_registered_with_ordered_effects():
     _ensure_dc_ops()
-    from torch._higher_order_ops.effects import SIDE_EFFECTS
+    from torch._higher_order_ops.effects import _EffectType
 
     for name, _, _ in offload_pass._OFFLOAD_OP_SPECS:
         overload = getattr(torch.ops.dc, name).default
         # Only the ORDERED effect protects these ops from inductor's scheduler DCE;
         # _side_effectful_functions covers FX's DCE alone. The next test proves the mechanism.
-        assert overload in SIDE_EFFECTS
+        assert _registered_effect(overload) == _EffectType.ORDERED
 
 
 def test_side_effect_ops_survive_stock_inductor():

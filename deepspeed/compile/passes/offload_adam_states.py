@@ -211,11 +211,6 @@ def sync_reload_states(event=None):
 # boundary; the anchor tensor exists only to give the dispatcher something to route on.
 _op_task_registry = []
 _offload_ops_lib = None
-# Strong references to the registered overloads. torch keeps the ORDERED effect in a
-# weak-key dictionary, so the registration lapses if the overload object is ever collected --
-# and a lapsed registration is silent: inductor drops the ops and training runs with the
-# states resident.
-_registered_overloads = []
 
 # Rank-local op execution counts. Reloads are skipped while profiling, so a nonzero reload
 # count proves the ops ran in the compiled graph -- the only cheap detector for the silent
@@ -305,22 +300,19 @@ def register_offload_ops():
             lib.define(schema)
             lib.impl(name, impl, "CompositeExplicitAutograd")
             lib.impl(name, lambda *args: None, "Meta")
+
+        # Nothing consumes these ops' output, so two dead-code eliminations would drop them: FX's,
+        # guarded by _side_effectful_functions, and inductor's scheduler DCE, which keys off the
+        # schema instead. The ORDERED effect covers the second and pins the ops in program order,
+        # which reload-before-sync depends on.
+        for name, _, _ in _OFFLOAD_OP_SPECS:
+            overload = getattr(torch.ops.dc, name).default
+            torch.fx.node._side_effectful_functions.add(overload)
+            if _register_effectful_op is not None:
+                _register_effectful_op(overload, _EffectType.ORDERED)
+
         # The ops deregister if the library object is garbage collected.
         _offload_ops_lib = lib
-
-    # Marking runs on every call, not only the first. Nothing consumes these ops' output, so two
-    # dead-code eliminations would drop them: FX's, guarded by _side_effectful_functions, and
-    # inductor's scheduler DCE, which keys off the schema instead. The ORDERED effect covers the
-    # second and pins the ops in program order, which reload-before-sync depends on. That effect
-    # lives in a weak-keyed registry attached to the overload object, so anything that rebuilds
-    # the "dc" namespace silently drops it; re-marking here repairs that before each compile.
-    for name, _, _ in _OFFLOAD_OP_SPECS:
-        overload = getattr(torch.ops.dc, name).default
-        torch.fx.node._side_effectful_functions.add(overload)
-        if overload not in _registered_overloads:
-            _registered_overloads.append(overload)
-        if _register_effectful_op is not None:
-            _register_effectful_op(overload, _EffectType.ORDERED)
 
 
 def _find_graph_anchor(graph: Graph):
