@@ -110,7 +110,7 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
                 if compile_config.offload_opt_states_tune:
                     from .backend import init_offload_tuner
                     from .offload_tuner import OffloadTuner
-                    from .passes.offload_adam_states import MARGIN
+                    from .passes.offload_adam_states import resolve_margin
                     # Tuning rounds rerun every pass EXCEPT selective gather: set_persistent()
                     # has no release path (invalidate_gathered_param and clear_all_gathered_params
                     # both skip persistent params), so running the pass again only ever adds more
@@ -118,8 +118,13 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
                     # the piece count the offload planner must schedule, and the tuner can never
                     # return to a smaller count. Persisting what the first combined phase chose
                     # keeps every round comparable and leaves the piece count as the only variable.
-                    tune_passes = [p for p in combined if p is not selective_gather.selective_gather]
-                    budget = get_accelerator().total_memory() * (1 - MARGIN)
+                    # DS_DC_TUNE_KEEP_SG=1 keeps it in, so the cost of freezing the persistent
+                    # set can be measured against the cost of letting it grow every round.
+                    if os.environ.get("DS_DC_TUNE_KEEP_SG") == "1":
+                        tune_passes = combined
+                    else:
+                        tune_passes = [p for p in combined if p is not selective_gather.selective_gather]
+                    budget = get_accelerator().total_memory() * (1 - resolve_margin())
                     init_offload_tuner(OffloadTuner(compile_config.offload_opt_states_tune_rounds, budget),
                                        tune_passes)
         else:

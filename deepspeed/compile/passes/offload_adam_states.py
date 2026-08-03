@@ -109,6 +109,23 @@ def _resolve_piece_target():
     return offload_piece_target
 
 
+def resolve_margin():
+    """Experiment hook (DS_DC_OFFLOAD_MARGIN): the fraction of device memory held back.
+
+    The margin decides how early a reload may be placed, so it is the knob that separates a
+    plan bounded by memory from the deadline override in the placement loop. Prefetch and
+    selective gather apply 0.1 to the same device; comparing the two is the point of the hook.
+    """
+    env_margin = os.environ.get("DS_DC_OFFLOAD_MARGIN")
+    return float(env_margin) if env_margin is not None else MARGIN
+
+
+def _deadline_enabled():
+    # Experiment hook (DS_DC_RELOAD_DEADLINE=0): placement then respects the memory budget only,
+    # and copies that never fit fall to the end of backward where they are exposed.
+    return os.environ.get("DS_DC_RELOAD_DEADLINE") != "0"
+
+
 def move_key(state, key, key_event=None):
     # Nothing to copy when the key is already offloaded (e.g. a second offload call in the
     # same phase); check before touching state[key] so the pinned-buffer setup cannot raise.
@@ -151,7 +168,12 @@ def _alloc_reload_buffer(like_tensor):
     # early-reload path (DS_DC_RELOAD_EARLY) fires at backward START, when activations
     # still fill the compute pool: allocate on copy_stream so the buffers recycle the
     # morning's freed copy blocks instead (the compute-pool form thrashed there).
-    if os.environ.get("DS_DC_RELOAD_EARLY") == "1":
+    # DS_DC_RELOAD_POOL picks the pool directly, so a run that reaches early placement through
+    # the memory budget can pair it with the copy pool the same way DS_DC_RELOAD_EARLY does.
+    pool = os.environ.get("DS_DC_RELOAD_POOL")
+    if pool is None:
+        pool = "copy" if os.environ.get("DS_DC_RELOAD_EARLY") == "1" else "compute"
+    if pool == "copy":
         with get_accelerator().stream(copy_stream):
             return torch.empty_like(like_tensor, device=device)
     return torch.empty_like(like_tensor, device=device)
@@ -495,7 +517,7 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
         # can be forced (or suppressed) independently of the hardware the run lands on.
         total_mem = float(budget_override) * 1e9
     else:
-        total_mem = accelerator.total_memory() * (1 - MARGIN)
+        total_mem = accelerator.total_memory() * (1 - resolve_margin())
     print_r0(f"offload_opt_states_inc start graph {graph_id} bwd={bwd} max_memory={max_memory} total_mem={total_mem}")
 
     mem = profiling_results[graph_id].bwd_mem if bwd else profiling_results[graph_id].fwd_mem
@@ -674,7 +696,8 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
                 # the whole headroom and raised the peak 107 -> 123 GB at sequence 2400, which
                 # cost more in allocator stalls than the exposure it removed; the deadline uses
                 # only the time actually needed to hide the copy.
-                past_deadline = remaining_time_ms.get(node.name, 0.0) <= _reload_copy_time_ms(reload_tasks_remaining)
+                past_deadline = _deadline_enabled() and \
+                    remaining_time_ms.get(node.name, 0.0) <= _reload_copy_time_ms(reload_tasks_remaining)
                 while past_deadline or total_mem > peak_mem[node.name] + total_reload_mem + next_reload_mem:
                     expected_mem = peak_mem[node.name] + total_reload_mem
                     print_r0(
