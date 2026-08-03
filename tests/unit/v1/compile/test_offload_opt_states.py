@@ -80,18 +80,27 @@ def _run_fwd_pass(monkeypatch, graph, budget_gb="0"):
     return offload_pass.offload_opt_states_inc(graph, 0, [(0, True)], {0: prof}, 0.0, None, bwd=False)
 
 
-def test_rejects_zero_optimizer_offload(monkeypatch):
-    # ZeRO's own optimizer offload keeps the state on CPU for the whole step and runs the
-    # optimizer there; this pass keeps it resident when memory allows. Both owning the same
-    # state silently produces wrong behaviour, so the combination is refused up front --
-    # before init_z3 removes any hooks, which is why a bare stub engine reaches the check.
+@pytest.mark.parametrize("offload_device,rejected", [("cpu", True), ("nvme", True), ("none", False), ("unset", False)])
+def test_rejects_zero_optimizer_offload(offload_device, rejected):
+    # ZeRO's own optimizer offload keeps the state off the accelerator for the whole step and runs
+    # the optimizer there; this pass keeps it resident when memory allows. Both owning the same
+    # state silently produces wrong behaviour, so the combination is refused up front -- before
+    # init_z3 removes any hooks, which is why a bare stub engine reaches the check. An offload
+    # section that is present but inert must still be accepted: `offload_optimizer: {}` takes the
+    # default device "none", so only cpu and nvme actually move the state.
     from deepspeed.compile.init_z3 import init_z3
 
-    engine = SimpleNamespace(zero_offload_optimizer=lambda: SimpleNamespace(device="cpu"))
+    engine = SimpleNamespace(zero_use_cpu_optimizer=lambda: offload_device in ("cpu", "nvme"))
     compile_config = SimpleNamespace(offload_opt_states=True)
 
-    with pytest.raises(ValueError, match="offload_optimizer"):
-        init_z3(engine, "inductor", compile_config, {})
+    if rejected:
+        with pytest.raises(ValueError, match="offload_optimizer"):
+            init_z3(engine, "inductor", compile_config, {})
+    else:
+        # The stub has nothing past the check, so reaching anything else proves it was accepted.
+        with pytest.raises(AttributeError) as excinfo:
+            init_z3(engine, "inductor", compile_config, {})
+        assert "offload_optimizer" not in str(excinfo.value)
 
 
 def test_register_offload_ops_idempotent():

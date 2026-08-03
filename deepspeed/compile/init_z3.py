@@ -37,12 +37,14 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
 
     # Validate before touching the engine: everything below removes hooks and unpatches modules,
     # so raising later would leave a half-converted engine behind.
-    if compile_config.offload_opt_states and engine.zero_offload_optimizer() is not None:
+    # zero_use_cpu_optimizer(), not zero_offload_optimizer(): the latter returns the config
+    # object, which is present but inert for `offload_optimizer: {}` or `device: none`.
+    if compile_config.offload_opt_states and engine.zero_use_cpu_optimizer():
         raise ValueError("compile.offload_opt_states cannot be combined with ZeRO's "
-                         "zero_optimization.offload_optimizer: both manage the same optimizer state. "
-                         "ZeRO keeps it off the accelerator for the whole step and runs the optimizer "
-                         "there, while this pass keeps it resident when memory allows and moves it "
-                         "around the compiled graph. Enable one of them.")
+                         "zero_optimization.offload_optimizer set to cpu or nvme: both manage the "
+                         "same optimizer state. ZeRO keeps it off the accelerator for the whole step "
+                         "and runs the optimizer there, while this pass keeps it resident when memory "
+                         "allows and moves it around the compiled graph. Enable one of them.")
 
     optimizer = engine.optimizer
     use_opt = not isinstance(optimizer, DeepSpeedZeRoOffload)
