@@ -35,6 +35,15 @@ def _resolve_expected_grad_dtype(param):
 
 def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
 
+    # Validate before touching the engine: everything below removes hooks and unpatches modules,
+    # so raising later would leave a half-converted engine behind.
+    if compile_config.offload_opt_states and engine.zero_offload_optimizer() is not None:
+        raise ValueError("compile.offload_opt_states cannot be combined with ZeRO's "
+                         "zero_optimization.offload_optimizer: both manage the same optimizer state. "
+                         "ZeRO keeps it off the accelerator for the whole step and runs the optimizer "
+                         "there, while this pass keeps it resident when memory allows and moves it "
+                         "around the compiled graph. Enable one of them.")
+
     optimizer = engine.optimizer
     use_opt = not isinstance(optimizer, DeepSpeedZeRoOffload)
 

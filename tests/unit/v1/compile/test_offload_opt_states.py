@@ -19,8 +19,8 @@ from unit.common import DistributedTest
 from unit.util import bf16_required_version_check, skip_on_arch
 from unit.v1.compile.util import compare_loss
 
-pytestmark = pytest.mark.skipif(not required_torch_version(min_version=2.1),
-                                reason="Compile tests requires Pytorch version 2.1 or above")
+pytestmark = pytest.mark.skipif(not required_torch_version(min_version=2.6),
+                                reason="DeepCompile requires Pytorch version 2.6 or above")
 
 
 @pytest.fixture(autouse=True)
@@ -80,6 +80,20 @@ def _run_fwd_pass(monkeypatch, graph, budget_gb="0"):
     return offload_pass.offload_opt_states_inc(graph, 0, [(0, True)], {0: prof}, 0.0, None, bwd=False)
 
 
+def test_rejects_zero_optimizer_offload(monkeypatch):
+    # ZeRO's own optimizer offload keeps the state on CPU for the whole step and runs the
+    # optimizer there; this pass keeps it resident when memory allows. Both owning the same
+    # state silently produces wrong behaviour, so the combination is refused up front --
+    # before init_z3 removes any hooks, which is why a bare stub engine reaches the check.
+    from deepspeed.compile.init_z3 import init_z3
+
+    engine = SimpleNamespace(zero_offload_optimizer=lambda: SimpleNamespace(device="cpu"))
+    compile_config = SimpleNamespace(offload_opt_states=True)
+
+    with pytest.raises(ValueError, match="offload_optimizer"):
+        init_z3(engine, "inductor", compile_config, {})
+
+
 def test_register_offload_ops_idempotent():
     _ensure_dc_ops()
     lib_first = offload_pass._offload_ops_lib
@@ -103,6 +117,8 @@ def _registered_effect(overload):
 
 
 def test_offload_ops_registered_with_ordered_effects():
+    if offload_pass._register_effectful_op is None:
+        pytest.skip("torch without the effects registry; the pass falls back to the inductor DCE patch")
     _ensure_dc_ops()
     from torch._higher_order_ops.effects import _EffectType
 
@@ -116,6 +132,9 @@ def test_offload_ops_registered_with_ordered_effects():
 def test_side_effect_ops_survive_stock_inductor():
     # Stock inductor drops an anchor-only `-> ()` op unless it carries an ORDERED effect, and
     # keeps its program order with one. A throwaway namespace keeps this runnable on CPU.
+    if offload_pass._register_effectful_op is None:
+        pytest.skip("torch without the effects registry; the pass falls back to the inductor DCE patch")
+
     from torch.fx.experimental.proxy_tensor import make_fx
     from torch._higher_order_ops.effects import _EffectType, _register_effectful_op
     from torch._inductor.scheduler import Scheduler
