@@ -3,6 +3,8 @@
 
 # DeepSpeed Team
 
+import pytest
+
 from deepspeed.compile.offload_tuner import OffloadTuner, SETTLE_STEPS, MEASURE_STEPS
 
 GB = 1024**3
@@ -50,13 +52,37 @@ def test_offloads_more_when_peak_exceeds_the_budget():
     assert tuner.best_pieces == 3
 
 
-def test_ignores_settle_steps_and_medians_the_rest():
-    # The first steps after a recompile are warmup, and one slow step must not decide a round.
+def test_ignores_settle_steps_and_trims_stalls():
+    # The first steps after a recompile are warmup, and one stalled step must not decide a round.
     tuner = OffloadTuner(max_rounds=2, budget_bytes=100 * GB)
-    for step_time in [90.0] * SETTLE_STEPS + [2.0, 2.0, 9.0, 2.0, 2.0]:
+    for step_time in [90.0] * SETTLE_STEPS + [2.0] * (MEASURE_STEPS - 1) + [90.0]:
         verdict = tuner.observe(1, step_time, 1 * GB)
     assert verdict == 2
     assert tuner.best_time == 2.0
+
+
+def test_scores_a_round_by_its_mean_not_one_mode():
+    # Several configurations alternate fast and slow steps with period 2. A median returns
+    # whichever value the window happened to hold more of; the mean reflects what the run costs.
+    tuner = OffloadTuner(max_rounds=2, budget_bytes=100 * GB)
+    alternating = [2.0, 4.0] * MEASURE_STEPS
+    for step_time in [90.0] * SETTLE_STEPS + alternating[:MEASURE_STEPS]:
+        tuner.observe(1, step_time, 1 * GB)
+    assert tuner.best_time == pytest.approx(3.0)
+
+
+def test_restarts_the_window_when_a_phase_launches():
+    # The piece count is the same before and after the combined phase engages, so a window keyed
+    # only on the count spanned two schedules and scored the wrong one.
+    tuner = OffloadTuner(max_rounds=3, budget_bytes=100 * GB)
+    for _ in range(ROUND - 1):
+        tuner.observe(1, 9.0, 1 * GB)  # the previous schedule, slower
+    assert tuner.observe(1, 9.0, 1 * GB, new_phase=True) is None
+    assert len(tuner.samples) == 1
+
+    for _ in range(ROUND - 1):
+        tuner.observe(1, 2.0, 1 * GB)
+    assert tuner.best_time == pytest.approx(2.0)
 
 
 def test_waits_for_a_full_round_before_deciding():

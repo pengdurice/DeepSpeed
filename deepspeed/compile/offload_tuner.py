@@ -31,9 +31,14 @@ def _log(msg: str) -> None:
 
 # Steps to discard after a recompile before the timings mean anything.
 SETTLE_STEPS = 2
-# Steps to median over. Several configurations alternate fast and slow steps, so a couple of
+# Steps to average over. Several configurations alternate fast and slow steps, so a couple of
 # samples cannot tell two rounds apart.
-MEASURE_STEPS = 5
+MEASURE_STEPS = 6
+# Above this multiple of the window median a sample is a stall or a compile, not a step. Trimming
+# them lets the round be scored by its mean -- what total training time actually depends on --
+# rather than by a median, which on a series alternating fast and slow just returns whichever
+# value happened to appear more often in the window.
+OUTLIER_FACTOR = 3.0
 
 
 class OffloadTuner:
@@ -49,12 +54,15 @@ class OffloadTuner:
         self.best_pieces: Optional[int] = None
         self.best_time: Optional[float] = None
 
-    def observe(self, pieces: int, step_time: float, peak_bytes: float) -> Optional[int]:
+    def observe(self, pieces: int, step_time: float, peak_bytes: float, new_phase: bool = False) -> Optional[int]:
         """Feed one training step. Returns a piece count to recompile with, or None to continue."""
         if self.done:
             return None
 
-        if pieces != self.current_pieces:  # a new phase is running
+        # Restart on any phase launch, not only when the piece count changes. The count is the
+        # same before and after the combined phase engages, so keying off it alone let the first
+        # round average steps from two different schedules and score the wrong configuration.
+        if new_phase or pieces != self.current_pieces:
             self.current_pieces = pieces
             self.samples = []
 
@@ -62,7 +70,10 @@ class OffloadTuner:
         if len(self.samples) < SETTLE_STEPS + MEASURE_STEPS:
             return None
 
-        measured = statistics.median(self.samples[SETTLE_STEPS:])
+        window = self.samples[SETTLE_STEPS:]
+        floor = statistics.median(window)
+        kept = [t for t in window if t <= OUTLIER_FACTOR * floor]
+        measured = statistics.mean(kept)
         self.samples = []
         self.round += 1
         improved = self.best_time is None or measured < self.best_time

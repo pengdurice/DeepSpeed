@@ -109,7 +109,7 @@ def init_offload_tuner(tuner, passes):
     offload_tuner_passes = passes
 
 
-def _tune_offload_pieces(global_steps: int):
+def _tune_offload_pieces(global_steps: int, phase_launched: bool):
     """Measure this step and, when the tuner asks for a different piece count, queue a phase."""
     global _last_step_time
 
@@ -122,7 +122,7 @@ def _tune_offload_pieces(global_steps: int):
 
     pieces = len(offload_tasks_scheduled)
     peak = get_accelerator().max_memory_allocated()
-    next_pieces = offload_tuner.observe(pieces, now - previous, peak)
+    next_pieces = offload_tuner.observe(pieces, now - previous, peak, new_phase=phase_launched)
     if next_pieces is not None:
         set_offload_piece_target(next_pieces)
         # A settled tuner is reverting to a count this run already executed, so it is known to
@@ -135,7 +135,8 @@ def _tune_offload_pieces(global_steps: int):
 def launch_compile_passes(global_steps: int):
     global next_pass_step, next_passes
 
-    if len(remaining_schedule) > 0 and global_steps == remaining_schedule[0][0]:
+    phase_launched = len(remaining_schedule) > 0 and global_steps == remaining_schedule[0][0]
+    if phase_launched:
         _, next_passes = remaining_schedule.popleft()
         log_rank0(f"Launching compile passes: global_steps={global_steps} passes={next_passes}", True)
 
@@ -147,7 +148,7 @@ def launch_compile_passes(global_steps: int):
         frames_partitioned.clear()
 
     if offload_tuner is not None:
-        _tune_offload_pieces(global_steps)
+        _tune_offload_pieces(global_steps, phase_launched)
 
 
 def set_time_and_tensor_size(graph_id, graph: Graph, mem, bwd, profiling_results, mem_complete=True):
