@@ -45,6 +45,18 @@ class CompileConfig(DeepSpeedConfigModel):
     debug_log: bool = False
     """ Turn on/off the graph dumping """
 
+    autotp_overlap: bool = True
+    """ For the 'autotp' pass: lower the tensor-parallel collectives to functional collectives.
+    This drops the identity clone each column-parallel marker would otherwise leave in the forward
+    graph, and turns each collective into a separate issue and wait node. Setting it to False keeps
+    the previous behaviour exactly: one opaque, blocking custom op per collective. """
+
+    autotp_reorder: Optional[bool] = None
+    """ For the 'autotp' pass: let Inductor schedule compute into the gap between a collective and
+    its wait. Requires autotp_overlap. None (default) enables it only for tensor_parallel size >= 4:
+    measured on H200, it is worth +2.6% at tp=8 and +1.1% at tp=4, but -0.7% at tp=2, where there is
+    too little collective time to hide and the reordering costs more fusion than it recovers. """
+
     offload_parameters: bool = False
     """ Turn on/off the parameter offloading """
 

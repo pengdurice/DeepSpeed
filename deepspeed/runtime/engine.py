@@ -5620,7 +5620,7 @@ class DeepSpeedEngine(Module):
                            "rank of the TP group.")
 
         compile_kwargs['fullgraph'] = True
-        return init_autotp(self.module)
+        return init_autotp(self.module, self._config.compile_config, self.autotp_size())
 
     def get_deepcompile_backend(self, backend, compile_kwargs, schedule):
         if self.zero_optimization_stage() != ZeroStageEnum.optimizer_states \
