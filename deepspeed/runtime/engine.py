@@ -454,6 +454,9 @@ class DeepSpeedEngine(Module):
             set_log_level_from_string(self.log_level())
         autoep_replacement_sources = self._configure_expert_parallel(model)
         self._remap_client_optimizer_after_module_replacement(model, autoep_replacement_sources)
+        # Only the remap needs it. Keeping it would reference the discarded pre-shard expert
+        # weights for the rest of __init__, which is where ZeRO partitioning allocates.
+        del autoep_replacement_sources
         if self.autotp_size() > 1:
             self._configure_tensor_parallel(model, self.tensor_parallel_config())
         see_memory_usage("DeepSpeed Engine: After args sanity test", force=self.memory_breakdown())
