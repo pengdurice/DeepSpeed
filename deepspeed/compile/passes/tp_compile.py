@@ -94,7 +94,7 @@ def _originating_layer_type(node: Node):
 
 
 _MODULES_INDEX = re.compile(r"_modules\['([^']*)'\]")
-_ROOT_PREFIX = re.compile(r"^(?:L\['[^']*'\]|self)\.?")
+_ROOT_PREFIX = re.compile(r"^(?:L\['[^']*'\]|self)(?:\.|$)")
 
 
 def _normalize_fqn(fqn: Optional[str]) -> Optional[str]:
@@ -112,17 +112,20 @@ def _normalize_fqn(fqn: Optional[str]) -> Optional[str]:
 
 
 def iter_graphs(gm: GraphModule) -> Iterator[Graph]:
-    """Yield gm's graph and the graph of every nested GraphModule.
+    """Yield the graph of gm and of every nested GraphModule.
+
+    Uses modules() rather than recursing through named_children(): a GraphModule can sit under a
+    plain nn.Module, which a GraphModule-only recursion would never reach. nn.Module.modules()
+    already deduplicates by identity.
 
     Activation checkpointing (and any other higher-order op) lifts its body into a child
     GraphModule referenced by a get_attr node. A pass that walks only gm.graph never sees those
     nodes, so the parallel matmuls inside a checkpointed block would keep their module-level
     collectives switched off while never receiving a graph-level replacement.
     """
-    yield gm.graph
-    for _, child in gm.named_children():
-        if isinstance(child, GraphModule):
-            yield from iter_graphs(child)
+    for module in gm.modules():
+        if isinstance(module, GraphModule):
+            yield module.graph
 
 
 def _insert_row_collective(graph: Graph, matmul: Node) -> Node:
@@ -159,15 +162,16 @@ def _rewrite_graph(graph: Graph) -> Tuple[Set[str], Set[str]]:
     row_matmuls: List[Node] = []
 
     for node in list(graph.nodes):
-        if node.op != "call_function":
-            continue
-
         fqn, layer_type = _originating_layer(node)
         name = _normalize_fqn(fqn)
+        # Deliberately computed over EVERY node op, not just call_function. When a layer sits inside
+        # a checkpointed region, the only trace of it left in the root graph is the placeholder for
+        # its lifted weight -- so a call_function-only scan reports nothing reached, `missed` comes
+        # out empty, and the check cannot see the very failure it exists to catch.
         if name is not None and (_is_column_parallel(layer_type) or _is_row_parallel(layer_type)):
             reached.add(name)
 
-        if node.target not in _MATMUL_TARGETS:
+        if node.op != "call_function" or node.target not in _MATMUL_TARGETS:
             continue
 
         if _is_row_parallel(layer_type):
@@ -224,12 +228,11 @@ def pass_insert_tp_collectives(gm: GraphModule, real_inputs, deferred_names=None
 
 
 def pass_canonicalize(gm: GraphModule, real_inputs, **kwargs):
-    for graph in iter_graphs(gm):
-        graph.eliminate_dead_code()
-        graph.lint()
-    for child in gm.modules():
-        if isinstance(child, GraphModule):
-            child.recompile()
+    for module in gm.modules():
+        if isinstance(module, GraphModule):
+            module.graph.eliminate_dead_code()
+            module.graph.lint()
+            module.recompile()
 
 
 AUTOTP_PASSES = [
