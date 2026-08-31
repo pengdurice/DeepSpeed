@@ -642,18 +642,20 @@ def test_deferred_layer_run_eagerly_raises():
         layer(torch.randn(2, 4))
 
 
-@pytest.mark.parametrize("raw, expected", [
-    ("L['self']._modules['layers']._modules['0'].down_proj", "layers.0.down_proj"),
-    ("L['self']._modules['layers']._modules['0']", "layers.0"),
-    ("L['self'].head", "head"),
-    ("L['self']._modules['model']._modules['layers']._modules['0']._modules['self_attn']._modules['q_proj']",
-     "model.layers.0.self_attn.q_proj"),
-    ("self.head", "head"),
-    ("layers.0.down_proj", "layers.0.down_proj"),
-    # The root-prefix strip must be anchored: these start with "self" but the module is not the root.
-    ("self_attn.q_proj", "self_attn.q_proj"),
-    ("selfie.q_proj", "selfie.q_proj"),
-])
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("L['self']._modules['layers']._modules['0'].down_proj", "layers.0.down_proj"),
+        ("L['self']._modules['layers']._modules['0']", "layers.0"),
+        ("L['self'].head", "head"),
+        ("L['self']._modules['model']._modules['layers']._modules['0']._modules['self_attn']._modules['q_proj']",
+         "model.layers.0.self_attn.q_proj"),
+        ("self.head", "head"),
+        ("layers.0.down_proj", "layers.0.down_proj"),
+        # The root-prefix strip must be anchored: these start with "self" but the module is not the root.
+        ("self_attn.q_proj", "self_attn.q_proj"),
+        ("selfie.q_proj", "selfie.q_proj"),
+    ])
 def test_normalize_fqn_on_real_dynamo_strings(raw, expected):
     """The deferred-layer comparison is only as good as this function.
 
@@ -749,3 +751,30 @@ def test_collective_is_inserted_inside_a_checkpointed_subgraph():
     assert seen["top_level"] == 0, "the collectives should be inside the subgraph, not the root graph"
     assert seen["raised_without_recursion"], \
         "restricted to the top-level graph the pass inserted nothing and did not raise"
+
+
+def test_apply_autotp_preserves_the_two_argument_pass_contract():
+    """`passes` is an extension point; its contract is (gm, real_inputs).
+
+    Threading extra context to every pass unconditionally raises TypeError on any pass written
+    against that contract, before the pass even runs.
+    """
+    from deepspeed.compile.passes.tp_compile import apply_autotp
+
+    gm = torch.fx.symbolic_trace(torch.nn.Linear(4, 4))
+    seen = []
+
+    def two_argument_pass(gm, real_inputs):
+        seen.append("two")
+
+    def context_aware_pass(gm, real_inputs, deferred_names=None):
+        seen.append(("context", deferred_names))
+
+    def var_keyword_pass(gm, real_inputs, **kwargs):
+        seen.append(("kwargs", kwargs.get("deferred_names")))
+
+    apply_autotp(gm, (),
+                 passes=[two_argument_pass, context_aware_pass, var_keyword_pass],
+                 deferred_names={"layers.0.down_proj"})
+
+    assert seen == ["two", ("context", {"layers.0.down_proj"}), ("kwargs", {"layers.0.down_proj"})]

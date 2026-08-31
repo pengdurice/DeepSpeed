@@ -3,6 +3,7 @@
 
 # DeepSpeed Team
 
+import inspect
 import re
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
@@ -241,8 +242,25 @@ AUTOTP_PASSES = [
 ]
 
 
+def _run_pass(opt_pass, gm: GraphModule, real_inputs, **context):
+    """Call a pass, handing it only the extra context it actually accepts.
+
+    `passes` is a caller-supplied extension point whose contract is (gm, real_inputs). Passing a new
+    keyword to every pass unconditionally would raise TypeError on any two-argument pass written
+    against that contract, before the pass even runs.
+    """
+    try:
+        parameters = inspect.signature(opt_pass).parameters
+    except (TypeError, ValueError):  # builtins and some C callables expose no signature
+        return opt_pass(gm, real_inputs)
+
+    takes_var_keyword = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+    accepted = {k: v for k, v in context.items() if takes_var_keyword or k in parameters}
+    return opt_pass(gm, real_inputs, **accepted)
+
+
 def apply_autotp(gm: GraphModule, real_inputs, passes=None, deferred_names=None):
     """Apply the AutoTP transformation passes to the graph."""
     for opt_pass in passes or AUTOTP_PASSES:
-        opt_pass(gm, real_inputs, deferred_names=deferred_names)
+        _run_pass(opt_pass, gm, real_inputs, deferred_names=deferred_names)
     return gm
