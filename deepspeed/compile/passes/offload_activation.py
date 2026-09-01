@@ -279,6 +279,75 @@ def _skip_bytes(node) -> int:
         return 0
 
 
+def _alias_root(node: Node, no_copy_ops, cache: Dict[Node, Node]) -> Node:
+    """The node that allocated the storage `node` reads.
+
+    An aliasing op returns a tensor that shares the storage of its first tensor input, so following
+    that input back through the aliasing ops reaches the node that allocated the memory. A node
+    whose op is not an aliasing one owns its storage and is its own root. Ops that alias an input
+    other than the first are rare enough that they are not tracked; such a node is treated as
+    owning its storage, which only costs a copy that frees nothing.
+    """
+    chain = []
+    current = node
+    while current not in cache:
+        if current.target not in no_copy_ops:
+            break
+        base = next((arg for arg in current.all_input_nodes if isinstance(arg.meta.get("val"), torch.Tensor)), None)
+        if base is None or base in chain:
+            break
+        chain.append(current)
+        current = base
+
+    root = cache.get(current, current)
+    for aliasing_node in chain:
+        cache[aliasing_node] = root
+    cache[current] = root
+    return root
+
+
+def _storage_keeper_counts(graph: Graph, saved_nodes: List[Node], returned_to_caller, no_copy_ops,
+                           cache: Dict[Node, Node]) -> Dict[Node, int]:
+    """How many values that outlive the forward pass hold each storage.
+
+    Moving a saved value to the host releases its memory only if nothing else still points at that
+    storage. Three kinds of value still do: the graph's own inputs, which the caller owns; the
+    values the graph returns to the caller; and every other saved value.
+    """
+    counts = defaultdict(int)
+    keepers = [node for node in graph.nodes if node.op == "placeholder"]
+    keepers.extend(returned_to_caller)
+    keepers.extend(saved_nodes)
+    for keeper in keepers:
+        counts[_alias_root(keeper, no_copy_ops, cache)] += 1
+    return counts
+
+
+def _has_reloadable_layout(node: Node) -> bool:
+    """Whether the host round trip hands the backward pass back the tensor it was compiled for.
+
+    Both the host buffer and the reloaded device tensor are made with `empty_like`, which
+    reproduces the strides of a tensor only when that tensor is non-overlapping and dense. A view
+    that is not -- a strided slice, or an `expand`, whose zero strides also make `empty_like`
+    allocate the materialized size instead of the much smaller storage the view really holds --
+    comes back laid out differently from what the backward graph expects.
+    """
+    val = node.meta.get("val")
+    if not isinstance(val, torch.Tensor):
+        return False
+    shape, strides = val.shape, val.stride()
+    # Symbolic sizes or strides cannot be checked here; the static-size rule rejects them anyway.
+    if any(not isinstance(dim, int) for dim in (*shape, *strides)):
+        return False
+
+    expected = 1
+    for stride, size in sorted((s, d) for d, s in zip(shape, strides) if d != 1):
+        if stride != expected:
+            return False
+        expected *= size
+    return True
+
+
 def _eligible_activations(graph: Graph, graph_id: int, num_fwd_outputs, param_manager) -> List[Tuple[Node, int]]:
     """Every saved activation this pass is allowed to move, largest first."""
     output_node = get_output_node(graph)
@@ -306,6 +375,8 @@ def _eligible_activations(graph: Graph, graph_id: int, num_fwd_outputs, param_ma
     _skipped.clear()
 
     saved_nodes = [node for node in outputs[num_fwd_outputs:] if isinstance(node, Node)]
+    alias_roots: Dict[Node, Node] = {}
+    storage_keepers = _storage_keeper_counts(graph, saved_nodes, returned_to_caller, no_copy_ops, alias_roots)
 
     candidates = []
     seen = set()
@@ -324,10 +395,16 @@ def _eligible_activations(graph: Graph, graph_id: int, num_fwd_outputs, param_ma
             _skipped["param_or_output"] += _skip_bytes(node)
             continue
         # A value that only aliases another tensor shares its storage, so copying it out frees
-        # nothing while the tensor it aliases is still live.
+        # nothing while another value that outlives the forward pass still points at that storage.
+        # When no other value does -- AOTAutograd routinely saves the view and not the tensor it
+        # came from -- this view is the last holder, and moving it releases the whole allocation.
         if node.target in no_copy_ops:
-            _skipped["alias"] += _skip_bytes(node)
-            continue
+            if storage_keepers[_alias_root(node, no_copy_ops, alias_roots)] > 1:
+                _skipped["alias"] += _skip_bytes(node)
+                continue
+            if not _has_reloadable_layout(node):
+                _skipped["alias_layout"] += _skip_bytes(node)
+                continue
         # Only floating-point values are activations. The rest are bookkeeping the backward pass
         # needs -- indices, masks, and the random-number state that attention saves. That state is
         # the reason this test cannot be a device check: it lives on the host, but an op's traced

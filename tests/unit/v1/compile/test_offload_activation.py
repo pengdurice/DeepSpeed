@@ -467,6 +467,66 @@ def test_fwd_skips_values_that_alias_another_tensor(forced_budget):
     assert [n for n in _node_names(graph) if n.startswith("offload_")] == ["offload_act_1"]
 
 
+def _make_view_graph(base_is_saved, view_val=None):
+    """x -> relu(base) -> aten.view(viewed) -> sum(out), shaped the way the partitioner leaves it.
+
+    AOTAutograd saves whichever values the backward pass reads, and that is often the view alone.
+    The view is then the last value holding the storage `base` allocated, so moving it to the host
+    releases the whole allocation.
+    """
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    x.meta["val"] = _meta_tensor(16)
+
+    base = _add_node(graph, torch.relu, (x, ), "base", LARGE_NUMEL)
+    viewed = graph.create_node('call_function', torch.ops.aten.view.default, (base, [LARGE_NUMEL]), {}, name="viewed")
+    viewed.meta["val"] = _meta_tensor(LARGE_NUMEL) if view_val is None else view_val
+    out = _add_node(graph, torch.sum, (viewed, ), "out", 1)
+
+    graph.output((out, base, viewed) if base_is_saved else (out, viewed))
+    return graph
+
+
+def test_eligible_includes_saved_view_when_base_is_not_saved():
+    _ensure_dc_ops()
+    # Nothing but the view points at that storage once the forward pass ends: `base` is not saved,
+    # not returned, and read by nothing else. Dropping the view here is what left the memory floor
+    # growing about 5GB per thousand tokens per GPU on a 2xH200 Qwen3.5-9B run.
+    graph = _make_view_graph(base_is_saved=False)
+
+    eligible = offload_pass._eligible_activations(graph, 0, 1, {})
+
+    assert [node.name for node, _ in eligible] == ["viewed"]
+    assert offload_pass._skipped["alias"] == 0
+
+
+def test_eligible_skips_saved_view_when_base_is_also_saved():
+    _ensure_dc_ops()
+    # `base` is saved too, so it holds the storage on the device whatever the view does. Copying
+    # the view out would return nothing and cost a copy each way.
+    graph = _make_view_graph(base_is_saved=True)
+
+    eligible = offload_pass._eligible_activations(graph, 0, 1, {})
+
+    assert [node.name for node, _ in eligible] == ["base"]
+    assert offload_pass._skipped["alias"] == LARGE_SIZE
+
+
+def test_eligible_skips_a_saved_view_the_host_copy_would_not_reproduce():
+    _ensure_dc_ops()
+    # An expanded view repeats one row with a stride of zero. The host buffer is built with
+    # empty_like, which would allocate all four rows -- four times the storage the view actually
+    # holds -- and hand the backward pass different strides than it was compiled for.
+    expanded = torch.empty(LARGE_NUMEL, device="meta").expand(4, LARGE_NUMEL)
+    graph = _make_view_graph(base_is_saved=False, view_val=expanded)
+
+    eligible = offload_pass._eligible_activations(graph, 0, 1, {})
+
+    assert eligible == []
+    assert offload_pass._skipped["alias"] == 0
+    assert offload_pass._skipped["alias_layout"] == 4 * LARGE_SIZE
+
+
 def test_fwd_skips_values_already_on_the_host(forced_budget):
     _ensure_dc_ops()
     graph = _make_fwd_graph()
