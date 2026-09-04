@@ -96,6 +96,10 @@ def _make_spec(**kwargs):
     return MoELayerSpec(**defaults)
 
 
+def _get_expert_weight_for_test(expert, name):
+    return ep_repack._get_expert_weight(expert, name)
+
+
 def _assert_same_dtype_device(actual, expected):
     assert actual.dtype == expected.dtype
     assert actual.device == expected.device
@@ -1612,3 +1616,88 @@ class TestClientOptimizerRemap:
 
         with pytest.raises(RuntimeError, match="split across param groups"):
             _remap(optimizer, model, replacement_sources)
+
+
+class TestReplacementSourceMap:
+    """The map the client-optimizer remap consults.
+
+    ``_remap_client_optimizer_after_module_replacement`` adds only parameters that appear in this
+    map, so a replacement parameter missing from it would be silently left out of the optimizer --
+    the very failure the remap exists to prevent. That makes full coverage of the map an invariant
+    worth asserting directly rather than inferring from an end-to-end run.
+    """
+
+    def _module_list_model(self, monkeypatch):
+        monkeypatch.setattr(get_preset_adapter("deepseek_v3"), "_installed_transformers_version", lambda: "5.0.0")
+        model = MockDeepSeekV3Transformer(num_layers=1, num_experts=4).to(dtype=torch.bfloat16)
+        auto_ep = AutoEP(model, _runtime_config(enabled=True, autoep_size=2))
+        return model, auto_ep, auto_ep.ep_parser()[0]
+
+    def test_map_covers_every_parameter_the_replacement_allocated(self, monkeypatch):
+        model, auto_ep, spec = self._module_list_model(monkeypatch)
+
+        replacement, sources = auto_ep._replace_moe_layer_without_retarget(spec,
+                                                                           ep_size=2,
+                                                                           ep_rank=0,
+                                                                           collect_sources=True)
+
+        # shared_experts are carried over from the source module unchanged, so they never left the
+        # optimizer and need no entry; everything else is newly allocated and must be covered.
+        uncovered = [
+            name for name, param in replacement.named_parameters()
+            if id(param) not in sources and not name.startswith("shared_experts")
+        ]
+        assert not uncovered, f"replacement parameters missing from the source map: {uncovered}"
+        assert all(sources[id(p)] for _, p in replacement.named_parameters() if id(p) in sources), \
+            "a replacement parameter was mapped to an empty source list"
+
+    def test_no_map_is_built_and_nothing_is_stashed_when_not_requested(self, monkeypatch):
+        """The default path must hold no reference to the discarded pre-shard expert weights."""
+        model, auto_ep, spec = self._module_list_model(monkeypatch)
+
+        replacement, sources = auto_ep._replace_moe_layer_without_retarget(spec, ep_size=2, ep_rank=0)
+
+        assert sources == {}
+        assert not hasattr(replacement, "_autoep_replacement_sources"), \
+            "the replacement is holding the source weights on an attribute"
+
+    def test_module_list_sources_are_this_ranks_local_experts(self, monkeypatch):
+        model, auto_ep, spec = self._module_list_model(monkeypatch)
+        experts_source = getattr(model.model.layers[0].mlp, spec.experts_name)
+
+        rank0 = ep_repack.repack_expert_source_params(experts_source=experts_source, spec=spec, ep_rank=0, ep_size=2)
+        rank1 = ep_repack.repack_expert_source_params(experts_source=experts_source, spec=spec, ep_rank=1, ep_size=2)
+
+        w1_rank0, _, _ = rank0
+        w1_rank1, _, _ = rank1
+        assert len(w1_rank0) == 2 and len(w1_rank1) == 2, "expected one source per local expert"
+        assert [id(p) for p in w1_rank0
+                ] == [id(_get_expert_weight_for_test(experts_source[i], spec.expert_w1_name)) for i in (0, 1)]
+        assert [id(p) for p in w1_rank1
+                ] == [id(_get_expert_weight_for_test(experts_source[i], spec.expert_w1_name)) for i in (2, 3)]
+
+    def test_module_list_rejects_a_source_it_cannot_index(self):
+        """Matches the assertion the other two module_list repack helpers already make."""
+        spec = _make_spec(expert_storage="module_list",
+                          expert_w1_name="gate_proj",
+                          expert_w2_name="down_proj",
+                          expert_w3_name="up_proj")
+        with pytest.raises(AssertionError, match="Expected nn.ModuleList"):
+            ep_repack.repack_expert_source_params(experts_source=nn.Module(), spec=spec, ep_rank=0, ep_size=1)
+
+    def test_fused_gate_up_source_feeds_both_w1_and_w3(self):
+        """With no separate w3 name the single fused tensor is the source for both."""
+        spec = _make_spec(expert_storage="fused_3d", expert_w3_name=None)
+        experts_source = nn.Module()
+        experts_source.gate_up_proj = nn.Parameter(
+            torch.randn(spec.num_experts, 2 * spec.ffn_hidden_size, spec.hidden_size))
+        experts_source.down_proj = nn.Parameter(torch.randn(spec.num_experts, spec.hidden_size, spec.ffn_hidden_size))
+
+        w1, w2, w3 = ep_repack.repack_expert_source_params(experts_source=experts_source,
+                                                           spec=spec,
+                                                           ep_rank=0,
+                                                           ep_size=1)
+
+        assert [id(p) for p in w1] == [id(experts_source.gate_up_proj)]
+        assert [id(p) for p in w3] == [id(experts_source.gate_up_proj)]
+        assert [id(p) for p in w2] == [id(experts_source.down_proj)]
