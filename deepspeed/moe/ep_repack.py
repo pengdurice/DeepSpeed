@@ -36,6 +36,13 @@ def _source_data(param: torch.Tensor | nn.Parameter) -> torch.Tensor:
     return param.data if torch.is_tensor(param) else param
 
 
+def _local_expert_range(spec: MoELayerSpec, ep_rank: int, ep_size: int) -> tuple[int, int]:
+    """Return the [start, end) slice of expert indices this rank owns."""
+    num_local_experts = spec.num_experts // ep_size
+    expert_start = ep_rank * num_local_experts
+    return expert_start, expert_start + num_local_experts
+
+
 def repack_expert_weights(
     experts_source: nn.Module,
     spec: MoELayerSpec,
@@ -63,9 +70,7 @@ def repack_expert_weights(
             w3 = up_proj:   [E_local, ffn_hidden, hidden]
             w2 = down_proj: [E_local, hidden, ffn_hidden]
     """
-    num_local_experts = spec.num_experts // ep_size
-    expert_start = ep_rank * num_local_experts
-    expert_end = expert_start + num_local_experts
+    expert_start, expert_end = _local_expert_range(spec, ep_rank, ep_size)
 
     if spec.expert_storage == "fused_3d":
         return _repack_fused_3d(experts_source, spec, expert_start, expert_end)
@@ -82,9 +87,7 @@ def repack_expert_requires_grad_flags(
     ep_size: int,
 ) -> tuple[bool, bool, bool]:
     """Return the requires_grad flags for repacked (w1, w2, w3) tensors."""
-    num_local_experts = spec.num_experts // ep_size
-    expert_start = ep_rank * num_local_experts
-    expert_end = expert_start + num_local_experts
+    expert_start, expert_end = _local_expert_range(spec, ep_rank, ep_size)
 
     if spec.expert_storage == "fused_3d":
         return _repack_fused_3d_requires_grad_flags(experts_source, spec)
@@ -107,11 +110,12 @@ def repack_expert_source_params(
     list because the mapping is not one-to-one: the fused gate/up layout feeds both w1 and w3
     from a single source parameter, and module_list storage feeds one grouped tensor from one
     parameter per local expert.
-    """
-    num_local_experts = spec.num_experts // ep_size
-    expert_start = ep_rank * num_local_experts
-    expert_end = expert_start + num_local_experts
 
+    Note this is not a record of everything the replacement discards: for ``module_list`` storage
+    it names only this rank's local experts, while the replacement detaches every rank's. The
+    client-optimizer remap therefore decides what to *remove* by absence from the module tree,
+    and consults this map only to decide where the replacements go.
+    """
     if spec.expert_storage == "fused_3d":
         w1_source = getattr(experts_source, spec.expert_w1_name)
         w2_source = getattr(experts_source, spec.expert_w2_name)
@@ -120,6 +124,10 @@ def repack_expert_source_params(
             return [w1_source], [w2_source], [w1_source]
         return [w1_source], [w2_source], [getattr(experts_source, spec.expert_w3_name)]
     elif spec.expert_storage == "module_list":
+        assert isinstance(experts_source, nn.ModuleList), \
+            f"Expected nn.ModuleList for module_list storage, got {type(experts_source)}"
+
+        expert_start, expert_end = _local_expert_range(spec, ep_rank, ep_size)
         w1_sources = []
         w2_sources = []
         w3_sources = []

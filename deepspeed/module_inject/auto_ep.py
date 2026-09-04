@@ -491,8 +491,9 @@ class AutoEP:
         spec: MoELayerSpec,
         ep_size: int,
         ep_rank: int,
-    ) -> nn.Module:
-        from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
+        collect_sources: bool = False,
+    ) -> tuple[nn.Module, dict[int, list[nn.Parameter]]]:
+        from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer, collect_replacement_sources
 
         # Navigate to the parent module and get the child name
         parts = spec.moe_module_name.split(".")
@@ -511,9 +512,14 @@ class AutoEP:
             config=self.config,
         )
 
+        # Collected before the source module leaves the tree, and only when a caller-supplied
+        # optimizer needs it: the values are the discarded pre-shard expert weights.
+        sources = (collect_replacement_sources(source_module, replacement, spec, ep_size, ep_rank)
+                   if collect_sources else {})
+
         # Replace in-place on parent
         setattr(parent, child_name, replacement)
-        return replacement
+        return replacement, sources
 
     def _retarget_transformers_output_recorders(self, spec: MoELayerSpec, replacement: nn.Module) -> None:
         adapter = get_preset_adapter(spec.preset_adapter)
@@ -532,7 +538,7 @@ class AutoEP:
         ep_rank: int,
     ) -> None:
         """Replace a single MoE module with AutoEPMoELayer in-place on the model."""
-        replacement = self._replace_moe_layer_without_retarget(spec, ep_size, ep_rank)
+        replacement, _ = self._replace_moe_layer_without_retarget(spec, ep_size, ep_rank)
         self._retarget_transformers_output_recorders(spec, replacement)
 
         logger.info(f"AutoEP: replaced '{spec.moe_module_name}' with AutoEPMoELayer "
@@ -544,20 +550,23 @@ class AutoEP:
         specs: list[MoELayerSpec],
         ep_size: int,
         ep_rank: int,
+        collect_sources: bool = False,
     ) -> dict[int, list[nn.Parameter]]:
         """Replace multiple MoE modules and batch post-replacement recorder retargeting.
 
-        Returns the source parameters behind each replacement parameter, keyed by ``id()``, so
-        that a caller-supplied optimizer can put each replacement back into the param group its
-        sources belonged to. The entries are popped off the layers as they are collected, so the
-        discarded source tensors are only referenced until the engine has finished the remap.
+        With ``collect_sources``, returns the source parameters behind each replacement parameter,
+        keyed by ``id()``, so that a caller-supplied optimizer can put each replacement back into
+        the param group its sources belonged to. Those values are the discarded pre-shard expert
+        weights and stay alive until the engine has finished the remap, so the caller asks for
+        them only when there is such an optimizer. Otherwise the map is empty and each source
+        module is freed as its replacement takes its place.
         """
         replacements: list[tuple[MoELayerSpec, nn.Module]] = []
         replacement_sources: dict[int, list[nn.Parameter]] = {}
         for spec in specs:
-            replacement = self._replace_moe_layer_without_retarget(spec, ep_size, ep_rank)
+            replacement, sources = self._replace_moe_layer_without_retarget(spec, ep_size, ep_rank, collect_sources)
             replacements.append((spec, replacement))
-            replacement_sources.update(replacement.__dict__.pop("_autoep_replacement_sources", {}))
+            replacement_sources.update(sources)
             logger.info(f"AutoEP: replaced '{spec.moe_module_name}' with AutoEPMoELayer "
                         f"(ep_size={ep_size}, ep_rank={ep_rank}, "
                         f"local_experts={replacement.num_local_experts})")
