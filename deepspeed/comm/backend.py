@@ -18,7 +18,7 @@ In the future, directly use NCCL/MPI/Gloo/etc without requiring torch.distribute
  - T-MPI
 
 # Backend is the base class
-     -- NcclBackend, MpiBackend, and TorchBackend are the main subclasses. TorchBackend is the only officially supported backend for now.
+     -- TorchBackend is the only officially supported backend for now.
 """
 
 
