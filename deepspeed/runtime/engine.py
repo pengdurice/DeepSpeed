@@ -62,7 +62,7 @@ from deepspeed.runtime.dataloader import DeepSpeedDataLoader
 from deepspeed.runtime.zero.muon.muon_optimizer import MuonWithAuxAdam
 from deepspeed.runtime.constants import \
     ROUTE_TRAIN, ROUTE_PREDICT, ROUTE_EVAL, \
-    PLD_THETA, PLD_GAMMA, BFLOAT16, FP16, AMP, GRADIENT_ACCUMULATION_STEPS, \
+    PLD_THETA, PLD_GAMMA, BFLOAT16, FP16, GRADIENT_ACCUMULATION_STEPS, \
     DATA_PARALLEL_GROUP, GLOBAL_RANK, DDP_BFLOAT16, GRADIENT_ALLREDUCE_OP_MEAN
 from deepspeed.runtime.zero.config import ZeroStageEnum
 from deepspeed.checkpoint.constants import (
@@ -109,7 +109,6 @@ from deepspeed.runtime.data_pipeline.constants import DATA_SAMPLING, \
     RANDOM_LTD_ENABLED, RANDOM_LTD_LAYER_ID, RANDOM_LTD_LAYER_NUM, \
     RANDOM_LTD_LAYER_TOKEN_LR_SCHEDULE, RANDOM_LTD_LAYER_TOKEN_LR_ENABLED, \
     RANDOM_LTD_GLOBAL_BATCH_SIZE, RANDOM_LTD_MICRO_BATCH_SIZE, DATA_EFFICIENCY
-from deepspeed.runtime.data_pipeline.curriculum_scheduler import CurriculumScheduler
 from deepspeed.runtime.checkpoint_engine import (create_checkpoint_engine, TorchCheckpointEngine, CheckpointCommitInfo)
 
 from deepspeed.runtime.data_pipeline.data_routing.scheduler import RandomLTDScheduler
@@ -155,10 +154,8 @@ DeepSpeedSchedulerCallable = Callable[[Optimizer], _LRScheduler]
 
 try:
     import apex
-    from apex import amp
-    APEX_INSTALLED = True
+    APEX_INSTALLED = hasattr(apex, 'optimizers') and hasattr(apex.optimizers, 'FusedAdam')
 except ImportError:
-    # Fail silently so we don't spam logs unnecessarily if user isn't using amp
     APEX_INSTALLED = False
 
 
@@ -687,9 +684,6 @@ class DeepSpeedEngine(Module):
 
         if self.pld_enabled():
             self.progressive_layer_drop = self._configure_progressive_layer_drop()
-
-        if self.curriculum_enabled_legacy():
-            self.curriculum_scheduler_legacy = self._configure_curriculum_scheduler_legacy()
 
         if self.random_ltd_enabled():
             random_ltd_config = self.random_ltd_config()
@@ -1283,12 +1277,6 @@ class DeepSpeedEngine(Module):
     def pld_gamma(self):
         return self.pld_params()[PLD_GAMMA]
 
-    def curriculum_enabled_legacy(self):
-        return self._config.curriculum_enabled_legacy
-
-    def curriculum_params_legacy(self):
-        return self._config.curriculum_params_legacy
-
     def data_efficiency_enabled(self):
         return self._config.data_efficiency_enabled
 
@@ -1576,12 +1564,6 @@ class DeepSpeedEngine(Module):
 
     def bf16_optimizer_states(self):
         return self._config.bfloat16_config.bf16_optimizer_states
-
-    def amp_enabled(self):
-        return self._config.amp_enabled
-
-    def amp_params(self):
-        return self._config.amp_params
 
     def torch_autocast_enabled(self) -> bool:
         return self._config.torch_autocast_enabled
@@ -1922,8 +1904,6 @@ class DeepSpeedEngine(Module):
                 "managed_gradient_accumulation=False is not supported with pipeline parallelism"
             assert not self.is_deepcompile_enabled(), \
                 "managed_gradient_accumulation=False is not supported with DeepCompile"
-            assert not self.amp_enabled(), \
-                "managed_gradient_accumulation=False is not supported with Apex AMP"
 
     def _broadcast_model(self):
         if self.dist_backend is None:
@@ -2078,7 +2058,7 @@ class DeepSpeedEngine(Module):
             summary += "***********************************************"
             logger.info(summary)
 
-        if not (self.amp_enabled() or is_zero_init_model):
+        if not is_zero_init_model:
             self._broadcast_model()
 
     def _validate_zero3_moe_compatibility(self):
@@ -2185,11 +2165,6 @@ class DeepSpeedEngine(Module):
     def _do_optimizer_sanity_check(self, basic_optimizer):
         model_dtype, grad_accum_dtype = self.get_data_types()
         zero_enabled = self.zero_optimization()
-        amp_enabled = self.amp_enabled()
-        # config based assertions
-        assert (
-            not (amp_enabled and zero_enabled)
-        ), "Amp and ZeRO are not currently compatible, please use (legacy) fp16 mode which performs similar to amp opt_mode=O2"
         if zero_enabled:
             if not is_zero_supported_optimizer(basic_optimizer):
                 assert (
@@ -2205,18 +2180,6 @@ class DeepSpeedEngine(Module):
                                      "BF16 parameters and FP32 gradient accumulation")
                 return BFLOAT16
             return ZERO_OPTIMIZATION
-        elif amp_enabled:
-            if model_dtype != grad_accum_dtype:
-                raise NotImplementedError(
-                    "Model data type and gradient accumulation data type must be equal to use Amp")
-            if model_dtype == torch.bfloat16 or model_dtype == torch.float16:
-                raise NotImplementedError("Cannot enable both amp with (legacy) fp16 or bfloat16 mode")
-            try:
-                logger.info("Initializing Apex amp from: {}".format(amp.__path__))
-            except NameError:
-                # If apex/amp is available it will be imported above
-                raise RuntimeError("Unable to import apex/amp, please make sure it is installed")
-            return AMP
         # data type checks
         elif model_dtype == grad_accum_dtype:
             if model_dtype == torch.float32:
@@ -2266,13 +2229,6 @@ class DeepSpeedEngine(Module):
 
         if optimizer_wrapper == ZERO_OPTIMIZATION:
             self.optimizer = self._configure_zero_optimizer(basic_optimizer)
-        elif optimizer_wrapper == AMP:
-            amp_params = self.amp_params()
-            log_dist(f"Initializing AMP with these params: {amp_params}", ranks=[0])
-            model, self.optimizer = amp.initialize(self.module, basic_optimizer, **amp_params)
-            self._set_client_model(model)
-            self._broadcast_model()
-            # TODO: maybe need to broadcast experts differently?
         elif optimizer_wrapper in [FP16, DDP_BFLOAT16]:
             lp_dtype = torch.float16 if optimizer_wrapper == FP16 else torch.bfloat16
             self.optimizer = self._configure_fp16_optimizer(basic_optimizer, lp_dtype)
@@ -2738,10 +2694,6 @@ class DeepSpeedEngine(Module):
 
         return pld
 
-    def _configure_curriculum_scheduler_legacy(self):
-        scheduler = CurriculumScheduler(self.curriculum_params_legacy())
-        return scheduler
-
     @staticmethod
     def is_map_style_dataset(obj):
         return hasattr(obj, "__getitem__") and hasattr(obj, "__len__")
@@ -2886,15 +2838,6 @@ class DeepSpeedEngine(Module):
             if self.module.training:
                 if self.progressive_layer_drop:
                     kwargs.update(self.progressive_layer_drop.get_state())
-
-            if self.__class__.__name__ != "PipelineEngine":
-                # TODO: The above if condition is a HACK since for PipelineEngine
-                # it's difficult to inject argument in forward pass.
-                if self.module.training and self.curriculum_enabled_legacy():
-                    self.curriculum_scheduler_legacy.update_difficulty(self.global_steps + 1)
-                    if self.curriculum_params_legacy()["curriculum_type"] == "seqlen":
-                        kwargs.update({"curriculum_seqlen": self.curriculum_scheduler_legacy.get_current_difficulty()})
-                        return_modified = True
 
         if self.module.training and self.random_ltd_enabled():
             self.random_ltd_scheduler.update_seq(self.global_steps)
@@ -3087,8 +3030,6 @@ class DeepSpeedEngine(Module):
 
         see_memory_usage("Engine before backward", force=self.memory_breakdown())
 
-        assert not self.amp_enabled(), "Apex AMP is not supported with non-scalar backward"
-
         if self.is_deepcompile_active() and not self.compile_autotp():
             deepcompile_backward_prologue(self.is_gradient_accumulation_boundary())
 
@@ -3156,8 +3097,6 @@ class DeepSpeedEngine(Module):
                 needs_scaler = self.optimizer.needs_scaler()
             elif self.torch_autocast_z0_gradscaler is not None:
                 needs_scaler = True
-            elif self.amp_enabled():
-                needs_scaler = True
 
             if needs_scaler and not self._manual_backward_expected:
                 # User called backward() directly without using engine.scale() or engine.backward()
@@ -3165,8 +3104,6 @@ class DeepSpeedEngine(Module):
                              "directly without scaling the loss. Please use one of the following:"
                              " 1. engine.backward(loss)"
                              " 2. engine.scale(loss).backward()")
-                if self.amp_enabled():
-                    error_msg += " Note: AMP (NVIDIA Apex) only supports engine.backward(loss)."
                 raise RuntimeError(error_msg)
 
             # Clear the flag for next backward
@@ -3317,9 +3254,6 @@ class DeepSpeedEngine(Module):
             Scaled loss tensor ready for .backward() call
 
         Raises:
-            RuntimeError: If AMP (NVIDIA Apex) is enabled. AMP requires using engine.backward()
-                         directly as it uses a context manager that cannot be separated from
-                         the backward call.
             AssertionError: If loss is not a scalar tensor with grad_fn, or if no optimizer
                            is configured.
         """
@@ -3327,12 +3261,6 @@ class DeepSpeedEngine(Module):
             "must provide optimizer during init in order to use scale"
         assert maybe_loss_for_backward(loss), \
             "loss must be a scalar tensor with grad_fn. For non-scalar tensors, use tensor.backward(grad)"
-
-        # AMP (NVIDIA Apex) uses a context manager that wraps both scaling and backward,
-        # so it cannot be used with manual backward calls
-        if self.amp_enabled():
-            raise RuntimeError("engine.scale() is not compatible with AMP (NVIDIA Apex). "
-                               "When using AMP, you must call engine.backward(loss) instead of manual backward.")
 
         # Apply loss scaler based on optimizer type
         scaled_loss = loss
@@ -3393,14 +3321,7 @@ class DeepSpeedEngine(Module):
                         grad, engine_backward_graph_state))
 
             with compiled_autograd(self._is_compiled_autograd_enabled, self._compile_kwargs):
-                if self.zero_optimization() or not self.amp_enabled():
-                    loss.backward(**backward_kwargs)
-                elif self.amp_enabled():
-                    # AMP requires delaying unscale when inside gradient accumulation boundaries
-                    # https://nvidia.github.io/apex/advanced.html#gradient-accumulation-across-iterations
-                    delay_unscale = not self.is_gradient_accumulation_boundary()
-                    with amp.scale_loss(loss, self.optimizer, delay_unscale=delay_unscale) as scaled_loss:
-                        scaled_loss.backward(**backward_kwargs)
+                loss.backward(**backward_kwargs)
 
                 # backward_epilogue is not called in a hook when self._support_torch_style_backward is False
                 self._backward_epilogue()
@@ -3482,13 +3403,8 @@ class DeepSpeedEngine(Module):
             if self.torch_autocast_z0_gradscaler:
                 # Unscale for gradient clipping
                 self.torch_autocast_z0_gradscaler.unscale_(self.optimizer)
-            if not (self.fp16_enabled() or self.bfloat16_enabled() or self.amp_enabled() or self.zero_optimization()):
+            if not (self.fp16_enabled() or self.bfloat16_enabled() or self.zero_optimization()):
                 self.clip_fp32_gradients()
-            elif self.amp_enabled():
-                # AMP's recommended way of doing clipping
-                # https://nvidia.github.io/apex/advanced.html#gradient-clipping
-                master_params = amp.master_params(self.optimizer)
-                clip_grad_norm_(parameters=master_params, max_norm=self.gradient_clipping(), mpu=self.mpu)
         if self.torch_autocast_z0_gradscaler:
             self.torch_autocast_z0_gradscaler.step(self.optimizer)
             self.torch_autocast_z0_gradscaler.update()
@@ -3506,7 +3422,7 @@ class DeepSpeedEngine(Module):
                 self.optimizer.zero_grad()
             else:
                 self.zero_grad()
-        elif self.zero_optimization() or self.fp16_enabled() or self.amp_enabled():
+        elif self.zero_optimization() or self.fp16_enabled():
             self.optimizer.zero_grad()
         else:
             self.zero_grad()

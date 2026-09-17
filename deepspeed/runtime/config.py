@@ -41,7 +41,7 @@ from .swap_tensor.aio_config import get_aio_config
 from .model_checkpointing.config import get_checkpoint_config
 
 from .tensor_parallel import get_tensor_parallel_config
-from .data_pipeline.config import get_data_efficiency_enabled, get_data_efficiency_config, get_curriculum_enabled_legacy, get_curriculum_params_legacy
+from .data_pipeline.config import get_data_efficiency_enabled, get_data_efficiency_config
 from .data_pipeline.constants import *
 
 from ..utils.config import get_timers_config
@@ -85,6 +85,9 @@ _REMOVED_TOP_LEVEL_CONFIG_KEYS = {
     "compression_training":
     "The DeepSpeed compression library has been removed. A leftover 'compression_training' "
     f"block would be ignored and the model would train unquantized. See {_REMOVED_FEATURES_ISSUE}.",
+    "amp":
+    "NVIDIA Apex AMP integration has been removed. Use DeepSpeed 'fp16', 'bf16', or 'torch_autocast' "
+    f"instead. See {_REMOVED_FEATURES_ISSUE}.",
     "quantize_training":
     "Mixture-of-Quantization (MoQ) / 'quantize_training' has been removed. See "
     f"{_REMOVED_FEATURES_ISSUE}.",
@@ -102,6 +105,9 @@ _REMOVED_TOP_LEVEL_CONFIG_KEYS = {
     "elasticity":
     "Elastic training has been removed; the 'elasticity' configuration block is no longer supported. "
     "Set train_batch_size / train_micro_batch_size_per_gpu / gradient_accumulation_steps directly. "
+    "curriculum_learning":
+    "Legacy top-level 'curriculum_learning' has been removed. Use "
+    "'data_efficiency.data_sampling.curriculum_learning' instead. "
     f"See {_REMOVED_FEATURES_ISSUE}.",
 }
 _REMOVED_ZERO_CONFIG_KEYS = {
@@ -176,22 +182,6 @@ def get_pld_params(param_dict):
         pld_params = copy.copy(param_dict[PROGRESSIVE_LAYER_DROP])
         pld_params.pop(PLD_ENABLED)
         return pld_params
-    else:
-        return False
-
-
-def get_amp_enabled(param_dict):
-    if AMP in param_dict.keys():
-        return get_scalar_param(param_dict[AMP], AMP_ENABLED, AMP_ENABLED_DEFAULT)
-    else:
-        return False
-
-
-def get_amp_params(param_dict):
-    if AMP in param_dict.keys():
-        amp_params = copy.copy(param_dict[AMP])
-        amp_params.pop(AMP_ENABLED)
-        return amp_params
     else:
         return False
 
@@ -530,9 +520,6 @@ class DeepSpeedConfig(object):
         assert not (self.float16_config.enabled
                     and self.bfloat16_config.enabled), 'bfloat16 and fp16 modes cannot be simultaneously enabled'
 
-        self.amp_enabled = get_amp_enabled(param_dict)
-        self.amp_params = get_amp_params(param_dict)
-
         self.torch_autocast_enabled = get_torch_autocast_enabled(param_dict)
         self.torch_autocast_dtype = get_torch_autocast_dtype(param_dict)
         self.torch_autocast_lower_precision_safe_modules = get_lower_precision_safe_modules(param_dict)
@@ -565,9 +552,6 @@ class DeepSpeedConfig(object):
 
         self.pld_enabled = get_pld_enabled(param_dict)
         self.pld_params = get_pld_params(param_dict)
-
-        self.curriculum_enabled_legacy = get_curriculum_enabled_legacy(param_dict)
-        self.curriculum_params_legacy = get_curriculum_params_legacy(param_dict)
 
         self.data_efficiency_enabled = get_data_efficiency_enabled(param_dict)
         self.data_efficiency_config = get_data_efficiency_config(param_dict)
