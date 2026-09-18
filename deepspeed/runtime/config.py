@@ -105,6 +105,7 @@ _REMOVED_TOP_LEVEL_CONFIG_KEYS = {
     "elasticity":
     "Elastic training has been removed; the 'elasticity' configuration block is no longer supported. "
     "Set train_batch_size / train_micro_batch_size_per_gpu / gradient_accumulation_steps directly. "
+    f"See {_REMOVED_FEATURES_ISSUE}.",
     "curriculum_learning":
     "Legacy top-level 'curriculum_learning' has been removed. Use "
     "'data_efficiency.data_sampling.curriculum_learning' instead. "
