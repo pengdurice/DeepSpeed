@@ -1482,7 +1482,7 @@ class TestAsyncSplitPlanLifecycle:
                 output = rows.new_zeros((handle.num_tokens, rows.shape[1]))
                 return output.index_add_(0, handle.token_indices, rows)
 
-        monkeypatch.setattr(auto_ep_layer, "DeepEPExchange", LoopbackExchange)
+        monkeypatch.setattr(auto_ep_layer, "shared_exchange", LoopbackExchange)
         hidden = torch.randn(1, 8, 64, dtype=torch.bfloat16)
         expected = layer(hidden)
         layer.async_split_plan = True
