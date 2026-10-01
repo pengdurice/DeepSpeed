@@ -18,6 +18,8 @@ gradient to be the same on every TP peer.
 """
 
 import copy
+import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -25,9 +27,10 @@ import torch
 import deepspeed
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
+from deepspeed.checkpoint import ds_to_universal
 from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
 from deepspeed.module_inject.layers import LinearAllreduce, LinearLayer, TensorParallel_Layer
-from deepspeed.utils import groups, safe_get_full_grad
+from deepspeed.utils import groups, safe_get_full_fp32_param, safe_get_full_grad
 from unit.common import DistributedTest
 
 transformers = pytest.importorskip("transformers")
@@ -296,3 +299,108 @@ class TestShardedAttentionFolding(DistributedTest):
             pytest.skip("AutoEP folding runs on an accelerator")
         assert dist.get_world_size() == world_size
         _check_folded_matches_reference(tp_size=tp_size, ep_size=ep_size, zero_stage=zero_stage, zero_init=zero_init)
+
+
+class TestTiedOutputHead(DistributedTest):
+    """Building the model under ``deepspeed.zero.Init`` must not change which layers AutoTP accepts.
+
+    AutoTP cannot shard an output head whose weight is tied to the input embedding by rows, and says
+    so. Under ``zero.Init`` AutoTP first gathers the partitioned head weight into a new parameter; if
+    the embedding keeps the old one, the tie is gone, the head is sharded anyway, and the embedding and
+    head train as two separate copies.
+    """
+    world_size = 4
+
+    @pytest.mark.parametrize("zero_init", [False, True])
+    def test_row_parallel_tied_head_is_refused(self, zero_init):
+        if get_accelerator().device_name() == "cpu":
+            pytest.skip("AutoEP folding runs on an accelerator")
+        config = _tiny_glm4_moe_config()
+        config.tie_word_embeddings = True
+        folded_config = _folded_config(tp_size=2, ep_size=2, zero_stage=3)
+        row_parallel_head = {"patterns": [r".*lm_head\.weight$"], "partition_type": "row"}
+        folded_config["tensor_parallel"]["partition_config"]["layer_specs"] = ATTENTION_ONLY_TP_SPECS + [
+            row_parallel_head
+        ]
+        if zero_init:
+            with deepspeed.zero.Init(config_dict_or_path=folded_config):
+                model = transformers.Glm4MoeForCausalLM(config)
+        else:
+            model = transformers.Glm4MoeForCausalLM(config).float()
+        assert model.lm_head.weight is model.model.embed_tokens.weight
+
+        # Not pytest.raises: when nothing is raised it raises pytest's Failed, a BaseException that the
+        # DistributedTest pool worker does not report, so the test would hang instead of failing.
+        try:
+            deepspeed.initialize(model=model, config=folded_config)
+        except NotImplementedError as error:
+            assert "tied weight" in str(error), error
+        else:
+            raise AssertionError("AutoTP sharded an output head whose weight is tied to the input embedding")
+
+
+class TestZero3FoldedCheckpoint(DistributedTest):
+    """A ZeRO-3 checkpoint of a folded run restores the training state exactly.
+
+    Train one step, save, load into an engine built the same way from a different random
+    initialization, then train one more step on both: the losses and every parameter must agree.
+    SGD momentum makes that step depend on the restored optimizer state. Universal Checkpoint
+    conversion of such a checkpoint is not supported yet and must say so.
+    """
+    world_size = 4
+
+    @pytest.mark.parametrize("zero_init", [False, True])
+    def test_save_load_resumes_training(self, zero_init, tmpdir):
+        if get_accelerator().device_name() == "cpu":
+            pytest.skip("AutoEP folding runs on an accelerator")
+        tp_size = 2
+        config = _tiny_glm4_moe_config()
+        folded_config = _folded_config(tp_size=tp_size, ep_size=2, zero_stage=3)
+        folded_config["optimizer"]["params"]["momentum"] = 0.9
+
+        def build_engine(seed):
+            torch.manual_seed(seed)
+            if zero_init:
+                with deepspeed.zero.Init(config_dict_or_path=folded_config):
+                    model = transformers.Glm4MoeForCausalLM(config)
+            else:
+                model = transformers.Glm4MoeForCausalLM(config).float()
+            engine, _, _, _ = deepspeed.initialize(model=model, config=folded_config)
+            return engine
+
+        logical_world_size = dist.get_world_size() // tp_size
+        logical_rank = dist.get_rank() // tp_size
+        engine = build_engine(seed=1234)
+        _run_to_boundary(engine, logical_rank, logical_world_size)
+        engine.step()
+        save_dir = str(tmpdir)
+        engine.save_checkpoint(save_dir, tag="step1")
+
+        resumed = build_engine(seed=999)
+        resumed.load_checkpoint(save_dir, tag="step1")
+        losses = _run_to_boundary(engine, logical_rank, logical_world_size)
+        resumed_losses = _run_to_boundary(resumed, logical_rank, logical_world_size)
+        engine.step()
+        resumed.step()
+        # Every rank gathers every parameter before any assertion: a rank that failed early would leave the
+        # others waiting in the next gather.
+        resumed_params = dict(resumed.module.named_parameters())
+        differing = []
+        for name, param in engine.module.named_parameters():
+            want = safe_get_full_fp32_param(param)
+            got = safe_get_full_fp32_param(resumed_params[name])
+            if not torch.allclose(got, want, rtol=1e-6, atol=1e-7):
+                differing.append(name)
+
+        conversion_error = None
+        args = SimpleNamespace(input_folder=os.path.join(save_dir, "step1"),
+                               output_folder=os.path.join(save_dir, f"universal_rank{dist.get_rank()}"))
+        try:
+            ds_to_universal.main(args)
+        except NotImplementedError as error:
+            conversion_error = str(error)
+
+        torch.testing.assert_close(resumed_losses, losses, rtol=1e-6, atol=1e-6)
+        assert not differing, f"{len(differing)} parameters differ after resuming: {differing}"
+        assert conversion_error is not None, "Universal conversion accepted a folded ZeRO-3 checkpoint"
+        assert "folded ZeRO-3 checkpoint is not supported" in conversion_error, conversion_error

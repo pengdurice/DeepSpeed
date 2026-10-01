@@ -4045,6 +4045,11 @@ class DeepSpeedEngine(Module):
         return "dense"
 
     def _autoep_zero_optimizer_param_families(self):
+        # The per-parameter record below assumes ZeRO-1/2, where each parameter group has one partition
+        # group. ZeRO-3 partitions each sub-group over its own group, records those partitions in its
+        # optimizer state (ds_zero_partition_groups), and refuses a checkpoint whose partitions differ.
+        if self.zero_optimization_partition_weights():
+            return None
         optimizer = self.optimizer
         real_dp_groups = getattr(optimizer, "real_dp_process_group", [])
         partition_counts = getattr(optimizer, "partition_count", [])

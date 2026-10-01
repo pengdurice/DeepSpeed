@@ -522,6 +522,16 @@ class AutoTP():
                 if hasattr(source, attr):
                     setattr(replacement, attr, getattr(source, attr))
             setattr(module, name, replacement)
+            # A module tied to this weight (an embedding sharing the output head's weight) must hold the same
+            # replacement. Otherwise the tie is broken here, and the tie checks that run after the gather
+            # find nothing to protect.
+            tied_owners = []
+            for other in self.module.modules():
+                for other_name, other_param in other.named_parameters(recurse=False, remove_duplicate=False):
+                    if other_param is source:
+                        tied_owners.append((other, other_name))
+            for other, other_name in tied_owners:
+                setattr(other, other_name, replacement)
             self.replacement_sources.sources[id(replacement)] = [source]
             self.replacement_sources.discarded.add(id(source))
 
