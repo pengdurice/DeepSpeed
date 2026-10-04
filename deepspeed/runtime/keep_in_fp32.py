@@ -1,3 +1,4 @@
+# Copyright (c) DeepSpeed Team.
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
@@ -39,15 +40,22 @@ def keep_in_fp32_pattern(module, setting, dtype):
     if dtype not in (torch.float16, torch.bfloat16):
         return None
     if setting is None or setting == KEEP_IN_FP32_AUTO:
-        names = set(getattr(module, "_keep_in_fp32_modules_strict", None) or [])
-        if dtype == torch.float16:
-            names |= set(getattr(module, "_keep_in_fp32_modules", None) or [])
+        patterns = set()
+        for module_name, child in module.named_modules():
+            child_names = set(getattr(child, "_keep_in_fp32_modules_strict", None) or [])
+            if dtype == torch.float16:
+                child_names |= set(getattr(child, "_keep_in_fp32_modules", None) or [])
+            for name in child_names:
+                pattern = name.replace("*", ".*")
+                if module_name:
+                    pattern = rf"^{re.escape(module_name)}\..*{pattern}"
+                patterns.add(pattern)
     else:
-        names = set(setting)
-    if not names:
+        patterns = {name.replace("*", ".*") for name in setting}
+    if not patterns:
         return None
     # The same rule as transformers' core_model_loading.build_glob_alternation followed by re.search.
-    return re.compile("|".join(name.replace("*", ".*") for name in sorted(names)))
+    return re.compile("|".join(sorted(patterns)))
 
 
 def buffers_to_keep_in_fp32(module, pattern):
