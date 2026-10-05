@@ -1219,16 +1219,24 @@ class DeepSpeedEngine(Module):
             vocab_head_autotp.set_tensor_parallel_config(tp_size, tp_config.tensor_parallel.tp_group)
             vocab_head_autotp._resolve_vocab_parallel_lm_head()
 
+        replacement_sources = ReplacementSourceMap()
         parser_dict = AutoTP.tp_parser(model)
         for client_module, injection_policy in parser_dict:
             tp_config.injection_policy_tuple = injection_policy
-            replace_transformer_layer(client_module, model, None, tp_config, model_config, training_mode=True)
+            replace_transformer_layer(client_module,
+                                      model,
+                                      None,
+                                      tp_config,
+                                      model_config,
+                                      training_mode=True,
+                                      replacement_sources=replacement_sources)
 
         if vocab_head_autotp is not None:
             vocab_head_autotp._replace_vocab_parallel_lm_head()
+            replacement_sources.update(vocab_head_autotp.replacement_sources)
         finalize_autotp(attach_uc_metadata=True,
                         require_vocab_parallel_lm_head=tp_config.vocab_parallel_lm_head is True)
-        return ReplacementSourceMap()
+        return replacement_sources
 
     def __del__(self):
         try:

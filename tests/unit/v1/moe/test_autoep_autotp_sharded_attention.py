@@ -29,7 +29,8 @@ import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed.checkpoint import ds_to_universal
 from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
-from deepspeed.module_inject.layers import LinearAllreduce, LinearLayer, TensorParallel_Layer
+from deepspeed.module_inject.auto_tp import AutoTP
+from deepspeed.module_inject.layers import LinearAllreduce, LinearLayer, TensorParallel_Layer, VocabParallelLinear
 from deepspeed.utils import groups, safe_get_full_fp32_param, safe_get_full_grad
 from unit.common import DistributedTest
 
@@ -404,3 +405,152 @@ class TestZero3FoldedCheckpoint(DistributedTest):
         assert not differing, f"{len(differing)} parameters differ after resuming: {differing}"
         assert conversion_error is not None, "Universal conversion accepted a folded ZeRO-3 checkpoint"
         assert "folded ZeRO-3 checkpoint is not supported" in conversion_error, conversion_error
+
+
+class _LlamaWithoutTPPlan(transformers.LlamaForCausalLM):
+    # With no HuggingFace tensor-parallel plan, AutoTP falls back to its heuristic layer matching.
+    _tp_plan = None
+
+
+def _tiny_llama_config(tied):
+    config = transformers.LlamaConfig(vocab_size=128,
+                                      hidden_size=32,
+                                      intermediate_size=64,
+                                      num_hidden_layers=2,
+                                      num_attention_heads=4,
+                                      num_key_value_heads=4,
+                                      head_dim=8,
+                                      use_cache=False,
+                                      tie_word_embeddings=tied)
+    config.base_model_tp_plan = None
+    config._attn_implementation = "eager"
+    return config
+
+
+def _zero_init_case(case):
+    """Model class, model config, DeepSpeed config, TP size, and whether the caller builds the optimizer."""
+    if case.startswith("folded"):
+        config = _tiny_glm4_moe_config()
+        ds_config = _folded_config(tp_size=2, ep_size=2, zero_stage=3)
+        ds_config["optimizer"]["params"]["momentum"] = 0.9
+        config.tie_word_embeddings = True
+        ds_config["tensor_parallel"]["vocab_parallel_lm_head"] = True
+        return transformers.Glm4MoeForCausalLM, config, ds_config, 2, False
+    tied = case == "heuristic_vocab_parallel_head"
+    ds_config = _common_config()
+    ds_config.pop("optimizer")
+    ds_config["zero_optimization"] = {"stage": 3}
+    ds_config["tensor_parallel"] = {"autotp_size": 2}
+    if tied:
+        ds_config["tensor_parallel"]["vocab_parallel_lm_head"] = True
+    return _LlamaWithoutTPPlan, _tiny_llama_config(tied), ds_config, 2, True
+
+
+def _initialize(model, ds_config, client_optimizer):
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9) if client_optimizer else None
+    engine, _, _, _ = deepspeed.initialize(model=model, optimizer=optimizer, config=copy.deepcopy(ds_config))
+    return engine
+
+
+def _train_two_windows(engine, tp_size):
+    logical_world_size = dist.get_world_size() // tp_size
+    logical_rank = dist.get_rank() // tp_size
+    losses = []
+    for _ in range(2):
+        losses += _run_to_boundary(engine, logical_rank, logical_world_size)
+        engine.step()
+    return losses
+
+
+ZERO_INIT_CASES = [
+    (4, "folded_vocab_parallel_head"),  # tied output head and embedding, vocabulary-parallel
+    (2, "heuristic"),  # no partition plan: AutoTP's heuristic layer matching
+    (2, "heuristic_vocab_parallel_head"),  # heuristic layers plus a tied vocabulary-parallel head
+]
+
+
+@pytest.mark.parametrize("world_size, case", ZERO_INIT_CASES)
+class TestZeroInitBuildMatchesPlainBuild(DistributedTest):
+    """Building the model under ``deepspeed.zero.Init`` must not change what AutoTP builds or how it trains.
+
+    Under ``zero.Init`` a weight is an empty placeholder until it is gathered, so every AutoTP path that
+    slices a weight must gather it first: a vocabulary-parallel output head and the embedding tied to
+    it, and the heuristic layer matching used when there is no partition plan. The
+    same weights are built plainly and under ``zero.Init``, trained for two accumulation windows, and
+    must give the same losses and parameters. In the heuristic cases the caller builds the optimizer
+    before ``deepspeed.initialize``, so it must also be re-pointed at the parameters AutoTP replaced.
+    """
+
+    def test_zero_init_matches_plain_build(self, world_size, case):
+        if get_accelerator().device_name() == "cpu":
+            pytest.skip("AutoTP under ZeRO-3 runs on an accelerator")
+        model_class, config, ds_config, tp_size, client_optimizer = _zero_init_case(case)
+        torch.manual_seed(1234)
+        plain_model = model_class(config).float()
+        state = copy.deepcopy(plain_model.state_dict())
+        with deepspeed.zero.Init(config_dict_or_path=ds_config):
+            zero_init_model = model_class(config)
+        with deepspeed.zero.GatheredParameters(list(zero_init_model.parameters()), modifier_rank=0):
+            if dist.get_rank() == 0:
+                zero_init_model.load_state_dict(state)
+
+        plain_engine = _initialize(plain_model, ds_config, client_optimizer)
+        zero_init_engine = _initialize(zero_init_model, ds_config, client_optimizer)
+        if case.endswith("vocab_parallel_head"):
+            head = zero_init_engine.module.lm_head
+            assert isinstance(head, VocabParallelLinear)
+            assert head.weight is zero_init_engine.module.get_input_embeddings().weight
+        plain_losses = _train_two_windows(plain_engine, tp_size)
+        zero_init_losses = _train_two_windows(zero_init_engine, tp_size)
+
+        # Every rank gathers every parameter before any assertion: a rank that failed early would leave the
+        # others waiting in the next gather.
+        plain_params = dict(plain_engine.module.named_parameters())
+        zero_init_params = dict(zero_init_engine.module.named_parameters())
+        assert zero_init_params.keys() == plain_params.keys(), sorted(set(zero_init_params) ^ set(plain_params))
+        differing = []
+        for name, param in zero_init_params.items():
+            want = safe_get_full_fp32_param(plain_params[name])
+            got = safe_get_full_fp32_param(param)
+            if got.shape != want.shape or not torch.allclose(got, want, rtol=1e-5, atol=1e-6):
+                differing.append(name)
+        torch.testing.assert_close(zero_init_losses, plain_losses, rtol=1e-5, atol=1e-5)
+        assert not differing, f"{len(differing)} parameters differ from the plain build: {differing}"
+
+
+class TestZeroInitEmbeddingSlice(DistributedTest):
+    """AutoTP must cut the same shard from an embedding table built under ``deepspeed.zero.Init`` as from a plain one.
+
+    ``_slice_embedding`` splits a table along its output width (dim 1). That suits tables whose columns follow the
+    attention heads, such as T5's relative-attention bias, which AutoTP's heuristic path slices inside a transformer
+    layer. Under ``zero.Init`` the table is an empty placeholder until it is gathered. The private method is called
+    directly to pin that fixed bug, because no model in these tests routes such a table through AutoTP.
+    """
+    world_size = 2
+
+    def test_zero_init_embedding_slices_like_plain(self):
+        if get_accelerator().device_name() == "cpu":
+            pytest.skip("ZeRO-3 partitioning runs on an accelerator")
+        torch.manual_seed(1234)
+        plain = torch.nn.Embedding(8, 4)  # [buckets, heads], like T5's relative_attention_bias
+        zero_config = {"train_micro_batch_size_per_gpu": 1, "zero_optimization": {"stage": 3}}
+        with deepspeed.zero.Init(config_dict_or_path=zero_config):
+            partitioned = torch.nn.Embedding(8, 4)
+        with deepspeed.zero.GatheredParameters([partitioned.weight], modifier_rank=0):
+            if dist.get_rank() == 0:
+                partitioned.weight.data.copy_(plain.weight.data)
+
+        def slice_with_autotp(embedding):
+            autotp = AutoTP(module=embedding,
+                            all_reduce_linears=[],
+                            prefix="",
+                            state_dict=None,
+                            linear_layer_setting=(torch.nn.Linear, torch.nn.Embedding),
+                            orig_layer_impl=None)
+            autotp.set_tensor_parallel_config(dist.get_world_size(), dist.get_world_group())
+            return autotp._slice_embedding(embedding, "relative_attention_bias", False)
+
+        want = slice_with_autotp(plain).weight.detach().cpu()
+        got = slice_with_autotp(partitioned).weight.detach().cpu()
+        assert want.shape == (8, 4 // dist.get_world_size())
+        assert torch.equal(got, want), (got, want)

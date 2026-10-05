@@ -418,6 +418,7 @@ class AutoTP():
         if "mlp.gate" == name or "q_a_proj" in name or "kv_a_proj_with_mqa" in name or name == "block_sparse_moe.gate" or (
             ('mlp.shared_expert_gate' == name or 'mlp.gate' == name) and 'qwen2_moe' in str(type(self.module))):
             return child
+        self._gather_zero3_params(child)
         # For Yuan model
         if 'Yuan' in str(self.module):
             if 'v_proj' in name:
@@ -612,6 +613,8 @@ class AutoTP():
         return self.vocab_parallel_lm_head and isinstance(child, nn.Linear) and self._is_lm_head_name(name)
 
     def _create_vocab_parallel_layer(self, child, name):
+        # A tied embedding gets the same gathered parameter, so it is still found as tied below.
+        self._gather_zero3_params(child)
         tied_embeddings = self._validate_vocab_parallel_layer(child, name)
         setattr(child, "replaced", True)
         vocab_parallel_linear = VocabParallelLinear(child, self.mp_group, name=name, tp_meta=self.tp_meta)
@@ -812,6 +815,8 @@ class AutoTP():
             # would leave the module double-partitioned and break the tied weight identity.
             return
 
+        source = child.weight
+        self._gather_zero3_params(child)
         mp_replace = ReplaceWithTensorSlicing(mp_group=self.mp_group)
 
         original_shape = tuple(child.weight.shape)
@@ -834,6 +839,10 @@ class AutoTP():
                                          partition_sizes=partition_sizes,
                                          target_partition_shape=tuple(new_embedding.weight.shape),
                                          original_shape=original_shape))
+        # The sliced embedding owns a new parameter, so a caller's optimizer must be re-pointed to it.
+        self.replacement_sources.sources.pop(id(child.weight), None)
+        self.replacement_sources.sources[id(new_embedding.weight)] = [source]
+        self.replacement_sources.discarded.add(id(source))
         setattr(child, "replaced", True)
         return new_embedding
 
