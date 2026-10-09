@@ -379,8 +379,11 @@ capacity fallback, assume its AWS role. The trust boundary is:
   uses only `g7.12xlarge` Spot, tries configured subnets in fixed `us-east-1`,
   `us-east-2`, `us-west-2` order, exposes exactly GPUs 0 and 1 to the container,
   and controls it through SSM. The instance has no inbound rules and a
-  60-minute termination guard. Every subprocess uses structural arguments,
-  and every nonzero clone/install/test status fails the check.
+  60-minute termination guard. SSM sends prepare and test output to a scoped,
+  expiring CloudWatch Logs group; the controller forwards new stdout/stderr
+  events through the same public-output masking path while each command is
+  running. Every subprocess uses structural arguments, and every nonzero
+  clone/install/test status fails the check.
 - The selected backend retains outbound network access because it must reach public
   GitHub, package indexes, PyTorch wheels, and optionally Transformers. Those
   services do not have stable CIDRs suitable for the SDK's CIDR allowlist, so
