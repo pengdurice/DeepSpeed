@@ -529,6 +529,7 @@ class EnableDeterminism:
         self.seed = seed + local_rank
         self.saved_random_state = None
         self.saved_np_random_state = None
+        self.saved_torch_rng_state = None
         self.saved_cuda_launch_blocking = None
         self.saved_cublas_workspace_config = None
         self.saved_deterministic_algorithms = None
@@ -536,6 +537,7 @@ class EnableDeterminism:
     def __enter__(self):
         self.saved_random_state = random.getstate()
         self.saved_np_random_state = np.random.get_state()
+        self.saved_torch_rng_state = torch.get_rng_state()
         self.saved_acc_rng_state = get_accelerator().get_rng_state()
         self.saved_cuda_launch_blocking = os.environ.get("CUDA_LAUNCH_BLOCKING", "")
         self.saved_cublas_workspace_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG", "")
@@ -543,6 +545,9 @@ class EnableDeterminism:
 
         random.seed(self.seed)
         np.random.seed(self.seed)
+        # The accelerator seed covers only tensors created on the accelerator. A model built on the CPU
+        # and moved afterwards draws its initial weights from torch's CPU generator.
+        torch.manual_seed(self.seed)
         get_accelerator().manual_seed(self.seed)
         get_accelerator().manual_seed_all(self.seed)
 
@@ -553,6 +558,7 @@ class EnableDeterminism:
     def __exit__(self, type, value, traceback):
         random.setstate(self.saved_random_state)
         np.random.set_state(self.saved_np_random_state)
+        torch.set_rng_state(self.saved_torch_rng_state)
         get_accelerator().set_rng_state(self.saved_acc_rng_state)
         os.environ["CUDA_LAUNCH_BLOCKING"] = self.saved_cuda_launch_blocking
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = self.saved_cublas_workspace_config
