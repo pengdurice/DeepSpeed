@@ -414,6 +414,7 @@ Enabling and configuring ZeRO memory optimizations
     "stage3_gather_16bit_weights_on_model_save": [true|false],
     "ignore_unused_parameters": [true|false],
     "round_robin_gradients": [true|false],
+    "overlap_param_gather": [true|false],
     "parameter_alignment": [true|false],
     "zero_hpz_partition_size": 1,
     "zero_quantized_weights": [true|false],
@@ -497,6 +498,12 @@ reduction and offload ordering and is not covered; a warning is logged.
 | Description                                                                                                                                                                                                                                                                         | Default |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
 | Stage 1 and 2 optimization for CPU offloading that parallelizes gradient copying to CPU memory among ranks by fine-grained gradient partitioning. Performance benefit grows with gradient accumulation steps (more copying between optimizer steps) or GPU count (increased parallelism). | `False` |
+
+***overlap_param_gather***: [boolean]
+
+| Description | Default |
+| ----------- | ------- |
+| Stage 1 and 2: deliver the parameters updated by a step to the other data-parallel ranks during the next forward pass instead of with one all-gather at the end of the step. Each rank broadcasts its partition in pieces of `allgather_bucket_size` elements, in the order in which the forward pass reads the parameters, and each module waits only for its own pieces. Code that reads the parameters outside a forward pass (other than DeepSpeed's own checkpointing and optimizer step) must first call `engine.optimizer.wait_param_gather()`. | `False` |
 
 ***parameter_alignment***: [boolean]
 

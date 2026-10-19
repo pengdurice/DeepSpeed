@@ -595,6 +595,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.reduce_bucket_size = int(reduce_bucket_size)
         self.use_multi_rank_bucket_allreduce = use_multi_rank_bucket_allreduce
         self.allgather_bucket_size = int(allgather_bucket_size)
+        # Set by overlap_param_gather_with_forward (zero_optimization.overlap_param_gather).
+        self.param_gather = None
 
         self.reduction_stream = None if get_accelerator().is_synchronized_device() else get_accelerator().Stream()
         #self.copy_grad_stream = get_accelerator().Stream()
@@ -3015,6 +3017,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         Not supporting closure.
         """
         self.micro_step_id = INITIAL_MICRO_STEP_ID
+        # The step writes this rank's partitions, which broadcasts of the last step may still read.
+        self.wait_param_gather()
         self._wait_for_offload_copies()
         if self.cpu_offload:
             self._offload_accumulated_param_ids = set()
@@ -3152,11 +3156,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.timers(OPTIMIZER_ALLGATHER_TIMER).start()
         # Gather the updated weights from everyone.
         # Then all partitions of the model parameters are updated and ready for next round forward.
-        all_gather_dp_groups(groups_flat=self.bit16_groups_flat,
-                             partitioned_param_groups=self.parallel_partitioned_bit16_groups,
-                             dp_process_group=self.real_dp_process_group,
-                             start_alignment_factor=self.nccl_start_alignment_factor,
-                             allgather_bucket_size=self.allgather_bucket_size)
+        if self.param_gather is not None:
+            self.param_gather.start()
+        else:
+            all_gather_dp_groups(groups_flat=self.bit16_groups_flat,
+                                 partitioned_param_groups=self.parallel_partitioned_bit16_groups,
+                                 dp_process_group=self.real_dp_process_group,
+                                 start_alignment_factor=self.nccl_start_alignment_factor,
+                                 allgather_bucket_size=self.allgather_bucket_size)
         self.timers(OPTIMIZER_ALLGATHER_TIMER).stop()
 
         # TODO: we probably don't need this? just to be safe
@@ -3168,8 +3175,23 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         return
 
+    def overlap_param_gather_with_forward(self, module):
+        """From the next step on, deliver the updated parameters during the forward pass of ``module`` instead of
+        all-gathering them at the end of the step (deepspeed/runtime/zero/forward_order_param_gather.py)."""
+        from deepspeed.runtime.zero.forward_order_param_gather import ForwardOrderParamGather
+        self.param_gather = ForwardOrderParamGather(module, self.bit16_groups_flat,
+                                                    self.parallel_partitioned_bit16_groups,
+                                                    self.round_robin_bit16_groups, self.round_robin_bit16_offsets,
+                                                    self.real_dp_process_group, self.allgather_bucket_size)
+
+    def wait_param_gather(self):
+        """Make the current stream wait until every parameter of the last step has arrived."""
+        if self.param_gather is not None:
+            self.param_gather.wait_all()
+
     @torch.no_grad()
     def update_lp_params(self):
+        self.wait_param_gather()
         for i, (bit16_partitions, fp32_partition) in enumerate(
                 zip(self.parallel_partitioned_bit16_groups, self.single_partition_of_fp32_groups)):
             partition_id = dist.get_rank(group=self.real_dp_process_group[i])
@@ -3366,6 +3388,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             checkpoint['optimizer'] = optimizer.state_dict()
             torch.save(checkpoint, "saved.pth")
         """
+        self.wait_param_gather()
         state_dict = {}
         state_dict[LOSS_SCALER] = self.loss_scaler
         state_dict['dynamic_loss_scale'] = self.dynamic_loss_scale

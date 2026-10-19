@@ -41,6 +41,7 @@ ZeRO optimization should be enabled as:
     "offload_optimizer": {...},
     "ignore_unused_parameters": [true|false],
     "round_robin_gradients": [true|false],
+    "overlap_param_gather": [true|false],
     "parameter_alignment": [true|false],
     "zero_hpz_partition_size": 1,
     "zero_quantized_weights": [true|false],
@@ -312,6 +313,17 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     copying to CPU memory among ranks by fine-grained gradient partitioning.
     Performance benefit grows with gradient accumulation steps (more copying
     between optimizer steps) or GPU count (increased parallelism).
+    """
+
+    overlap_param_gather: bool = False
+    """
+    Stage 1 and 2: deliver the parameters updated by a step to the other
+    data-parallel ranks while the next forward pass runs, instead of with one
+    all-gather at the end of the step. Each rank broadcasts its partition in
+    pieces of ``allgather_bucket_size`` elements, in the order in which the
+    forward pass reads the parameters, and each module waits for its pieces in
+    a forward pre-hook. Parameters read outside the forward pass of a module
+    that holds them must be waited for with ``optimizer.wait_param_gather()``.
     """
 
     parameter_alignment: bool = False

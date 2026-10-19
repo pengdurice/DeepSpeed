@@ -665,6 +665,126 @@ class TestIncorectAllgatherBucketSize(DistributedTest):
             assert ("allgather_bucket_size must be a multiple of nccl_start_alignment_factor" in str(assertinfo))
 
 
+class _LayerListModel(Module):
+
+    def __init__(self, hidden_dim, num_layers):
+        super().__init__()
+        self.inp = Linear(hidden_dim, hidden_dim)
+        self.layers = ModuleList([Linear(hidden_dim, hidden_dim) for _ in range(num_layers)])
+        self.out = Linear(hidden_dim, hidden_dim)
+
+    def forward(self, x, y):
+        x = self.inp(x)
+        for layer in self.layers:
+            x = torch.relu(layer(x))
+        return torch.nn.functional.mse_loss(self.out(x), y)
+
+
+@pytest.mark.parametrize("zero_stage", [1, 2])
+class TestOverlapParamGather(DistributedTest):
+    world_size = 2
+    reuse_dist_env = False
+
+    def _engine(self, zero_stage, overlap_param_gather):
+        torch.manual_seed(0)
+        model = _LayerListModel(hidden_dim=64, num_layers=4)
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 2,
+            "gradient_accumulation_steps": 2,
+            "zero_optimization": {
+                "stage": zero_stage,
+                # Many pieces per partition, so that the pieces of every module come from both ranks.
+                "allgather_bucket_size": 1000,
+                "overlap_param_gather": overlap_param_gather,
+            },
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1e-2
+                }
+            },
+        }
+        if get_accelerator().is_bf16_supported():
+            config_dict["bf16"] = {"enabled": True}
+        engine, _, _, _ = deepspeed.initialize(config=config_dict, model=model, model_parameters=model.parameters())
+        return engine
+
+    def _batches(self, engine, num_steps):
+        generator = torch.Generator().manual_seed(dist.get_rank())
+        dtype = engine.module.inp.weight.dtype
+        batches = []
+        for _ in range(num_steps * engine.gradient_accumulation_steps()):
+            x = torch.randn(2, 64, generator=generator).to(engine.device, dtype)
+            y = torch.randn(2, 64, generator=generator).to(engine.device, dtype)
+            batches.append((x, y))
+        return batches
+
+    def _train(self, engine, batches):
+        losses = []
+        for x, y in batches:
+            loss = engine(x, y)
+            engine.backward(loss)
+            engine.step()
+            losses.append(loss.detach().float())
+        return losses
+
+    def _params(self, engine):
+        engine.optimizer.wait_param_gather()
+        return [param.detach().float().clone() for param in engine.module.parameters()]
+
+    def test_matches_all_gather(self, zero_stage):
+        """Delivering the updated parameters during the next forward pass trains exactly like the all-gather."""
+        results = {}
+        for overlap_param_gather in (False, True):
+            engine = self._engine(zero_stage, overlap_param_gather)
+            batches = self._batches(engine, num_steps=4)
+            # Count the broadcasts of the training steps, so that a run that ignores the option fails.
+            broadcasts = []
+            original = dist.broadcast
+
+            def record(*args, **kwargs):
+                broadcasts.append(1)
+                return original(*args, **kwargs)
+
+            dist.broadcast = record
+            try:
+                losses = self._train(engine, batches)
+            finally:
+                dist.broadcast = original
+            results[overlap_param_gather] = (losses, self._params(engine), len(broadcasts))
+            engine.destroy()
+
+        reference_losses, reference_params, reference_broadcasts = results[False]
+        losses, params, num_broadcasts = results[True]
+        assert reference_broadcasts == 0
+        assert num_broadcasts > 0
+        for loss, reference_loss in zip(losses, reference_losses):
+            assert torch.equal(loss, reference_loss)
+        for param, reference_param in zip(params, reference_params):
+            assert torch.equal(param, reference_param)
+
+    def test_checkpoint_round_trip(self, tmpdir, zero_stage):
+        """A run saved and loaded with the option on continues exactly like the run that was not interrupted."""
+        engine = self._engine(zero_stage, overlap_param_gather=True)
+        batches = self._batches(engine, num_steps=4)
+        half = len(batches) // 2
+        self._train(engine, batches[:half])
+        engine.save_checkpoint(tmpdir)
+        reference_losses = self._train(engine, batches[half:])
+        reference_params = self._params(engine)
+        engine.destroy()
+
+        engine = self._engine(zero_stage, overlap_param_gather=True)
+        engine.load_checkpoint(tmpdir)
+        losses = self._train(engine, batches[half:])
+        params = self._params(engine)
+        engine.destroy()
+        for loss, reference_loss in zip(losses, reference_losses):
+            assert torch.equal(loss, reference_loss)
+        for param, reference_param in zip(params, reference_params):
+            assert torch.equal(param, reference_param)
+
+
 class TestPartitionNcclAlignment(DistributedTest):
     world_size = 2
 

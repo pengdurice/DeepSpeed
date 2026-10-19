@@ -1748,6 +1748,9 @@ class DeepSpeedEngine(Module):
     def zero_round_robin_gradients(self):
         return self._config.zero_config.round_robin_gradients
 
+    def zero_overlap_param_gather(self):
+        return self._config.zero_config.overlap_param_gather
+
     def zero_parameter_alignment(self):
         return self._config.zero_config.parameter_alignment
 
@@ -2366,7 +2369,17 @@ class DeepSpeedEngine(Module):
             self.optimizer = basic_optimizer
 
         self._configure_autoep_folding_optimizer_gradient_reduction()
+        self._configure_overlap_param_gather()
         log_dist("DeepSpeed Final Optimizer = {}".format(self.optimizer.__class__.__name__), ranks=[0])
+
+    def _configure_overlap_param_gather(self):
+        if not self.zero_overlap_param_gather():
+            return
+        overlap = getattr(self.optimizer, "overlap_param_gather_with_forward", None)
+        if overlap is None:
+            raise ValueError("zero_optimization.overlap_param_gather needs ZeRO stage 1 or 2, got the "
+                             f"{type(self.optimizer).__name__} optimizer")
+        overlap(self.module)
 
     def _configure_autoep_folding_optimizer_gradient_reduction(self):
         configure = getattr(self.optimizer, "configure_autoep_folding_tp_gradient_reduction", None)
@@ -4006,6 +4019,9 @@ class DeepSpeedEngine(Module):
         return tensor_list
 
     def module_state_dict(self, destination=None, prefix="", keep_vars=False, exclude_frozen_parameters=False):
+        wait_param_gather = getattr(self.optimizer, "wait_param_gather", None)
+        if wait_param_gather is not None:
+            wait_param_gather()
         sd = self.module.state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
 
         # Remove frozen parameter weights from state_dict if specified
