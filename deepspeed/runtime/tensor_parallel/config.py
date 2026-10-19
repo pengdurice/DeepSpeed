@@ -65,6 +65,22 @@ class TPTrainingConfig(DeepSpeedConfigModel):
     for ZeRO-3 partitioned weights.
     """
 
+    sequence_sharding_copy_engine: bool = False
+    """
+    With sequence_sharding_overlap: move the all-gathers and reduce-scatters of the attention and MLP blocks with the
+    GPU copy engines through PyTorch symmetric memory, overlapped with the GEMMs, instead of NCCL kernels, which
+    slow the GEMMs they run beside. Needs symmetric memory and a tensor-parallel group within one node; otherwise
+    NCCL is used.
+    """
+
+    sequence_sharding_copy_engine_min_tokens: int = -1
+    """
+    With sequence_sharding_copy_engine: use the copy engines only when this rank holds at least this many tokens of
+    the micro-batch, and NCCL below. Negative (default): chosen per pass, the forward pass when tokens per rank x
+    hidden x hidden is at least 45e9 and the backward pass when it is at least 25e9 (measured on 8 x H200 with
+    Qwen3-8B, Qwen3-32B and Qwen2.5-72B shapes).
+    """
+
     vocab_parallel_lm_head: Optional[bool] = None
     """True requires vocabulary sharding, False disables it, and None follows a supported HF tied-embedding plan."""
 

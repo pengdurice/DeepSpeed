@@ -9,6 +9,7 @@ import re
 from deepspeed import comm as dist
 from deepspeed.comm import pg_utils
 from deepspeed.module_inject.autotp_sequence_sharding import (reduce_scatter_from_tensor_parallel_block,
+                                                              row_parallel_to_sequence_shards,
                                                               take_precomputed_column_output)
 from torch import nn
 from torch.nn import functional as F
@@ -394,6 +395,8 @@ class TensorParallel_Layer(nn.Module, ABC):
     # sequence_sharding_dim over the tensor-parallel ranks outside its block.
     sequence_sharding: bool = False
     sequence_sharding_dim: int = 1
+    # The CopyEngineGroup of tensor_parallel.sequence_sharding_copy_engine, or None for NCCL.
+    sequence_sharding_copy_engine = None
 
     def __init__(self, mp_group: Optional[dist.ProcessGroup], **kwargs: Any):
         """
@@ -902,11 +905,15 @@ class LinearAllreduce(TensorParallel_Layer):
 
     def forward(self, input):
         self._assert_compiled_if_deferred()
-        output = torch.matmul(input, self.weight.transpose(-1, -2))
-        if self.sequence_sharding:
-            output = reduce_scatter_from_tensor_parallel_block(output, self.mp_group, self.sequence_sharding_dim)
-        elif not self.defer_collectives_to_compiler:
-            output = RowParallel.apply(self.mp_group, output, not self.is_training_mode())
+        if self.sequence_sharding and self.sequence_sharding_copy_engine is not None:
+            output = row_parallel_to_sequence_shards(input, self.weight, self.mp_group, self.sequence_sharding_dim,
+                                                     self.sequence_sharding_copy_engine)
+        else:
+            output = torch.matmul(input, self.weight.transpose(-1, -2))
+            if self.sequence_sharding:
+                output = reduce_scatter_from_tensor_parallel_block(output, self.mp_group, self.sequence_sharding_dim)
+            elif not self.defer_collectives_to_compiler:
+                output = RowParallel.apply(self.mp_group, output, not self.is_training_mode())
         if self.bias is not None:
             output = add_bias(output, self.bias)
         return output

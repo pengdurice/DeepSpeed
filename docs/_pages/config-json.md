@@ -803,6 +803,18 @@ When a HuggingFace model provides a built-in `tp_plan` (via `model.config.base_m
 | ----------- | ------- |
 | With `sequence_sharding`: run the column-parallel linears that read a block input (q/k/v, gate/up) in one autograd node and overlap the reduce-scatter of their input gradient with their weight-gradient GEMMs. Not used for ZeRO-3 partitioned weights. | `true` |
 
+***sequence_sharding_copy_engine***: [boolean]
+
+| Description | Default |
+| ----------- | ------- |
+| With `sequence_sharding_overlap`: move the block all-gathers and reduce-scatters with the GPU copy engines through PyTorch symmetric memory, overlapped with the GEMMs, instead of NCCL kernels. Needs symmetric memory and a tensor-parallel group within one node; otherwise NCCL is used. | `false` |
+
+***sequence_sharding_copy_engine_min_tokens***: [integer]
+
+| Description | Default |
+| ----------- | ------- |
+| With `sequence_sharding_copy_engine`: use the copy engines only when this rank holds at least this many tokens of the micro-batch, NCCL below. Negative: chosen per pass from tokens per rank x hidden x hidden (forward from 45e9, backward from 25e9). | `-1` |
+
 ***vocab_parallel_lm_head***: [boolean or null]
 
 | Description                                                                                                                                                  | Default |

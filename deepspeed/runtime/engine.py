@@ -1079,9 +1079,12 @@ class DeepSpeedEngine(Module):
                 setattr(model, UNIVERSAL_CHECKPOINT_INFO, collect_autotp_universal_checkpoint_info(model))
             if tp_config.sequence_sharding:
                 from deepspeed.module_inject.autotp_sequence_sharding import apply_autotp_sequence_sharding
-                apply_autotp_sequence_sharding(model,
-                                               tp_config.tensor_parallel.tp_group,
-                                               overlap=tp_config.sequence_sharding_overlap)
+                apply_autotp_sequence_sharding(
+                    model,
+                    tp_config.tensor_parallel.tp_group,
+                    overlap=tp_config.sequence_sharding_overlap,
+                    copy_engine=tp_config.sequence_sharding_copy_engine,
+                    copy_engine_min_tokens=tp_config.sequence_sharding_copy_engine_min_tokens)
             setattr(model, "ds_autotp_parsed", True)
 
         if partition_config is not None:
