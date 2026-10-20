@@ -25,12 +25,16 @@ Requirements, checked when it is applied:
   - the sequence length is divisible by the tensor-parallel size.
 Every replicated parameter inside the decoder layers (norm weights, row-parallel biases) then sees only this rank's
 part of the sequence or of the heads, so its gradient is summed over the tensor-parallel group.
+
+With ``tensor_parallel.sequence_sharding_copy_engine`` the all-gathers and reduce-scatters of the blocks move data
+with the GPU copy engines, overlapped with the GEMMs (deepspeed.comm.copy_engine), instead of NCCL kernels.
 """
 
 import torch
 from torch import nn
 
 from deepspeed import comm as dist
+from deepspeed.accelerator import get_accelerator
 from deepspeed.comm import pg_utils
 from deepspeed.runtime.zero.linear import autocast_custom_bwd, autocast_custom_fwd
 from deepspeed.runtime.zero.utils import is_zero_param
@@ -38,6 +42,11 @@ from deepspeed.utils.logging import print_dist
 from deepspeed.utils.torch import register_grad_hook
 
 SEQUENCE_SHARDING_ATTR = "_ds_autotp_sequence_sharding"
+
+
+def _as_dtype(t, dtype):
+    # Tensor.to is a dispatched op even when the dtype already matches; the copy-engine paths call it per block.
+    return t if t.dtype == dtype else t.to(dtype)
 
 
 def _shape_with(x, dim, size):
@@ -158,12 +167,21 @@ class ColumnGroupFromSequenceShards(torch.autograd.Function):
 
     @staticmethod
     @autocast_custom_fwd
-    def forward(ctx, x_shard, group, dim, *weights):
+    def forward(ctx, x_shard, group, dim, copy_engine, backward_copy_engine, *weights):
         ctx.set_materialize_grads(False)
-        ctx.group, ctx.dim = group, dim
+        ctx.group, ctx.dim, ctx.copy_engine = group, dim, backward_copy_engine
         ctx.world_size = dist.get_world_size(group=group)
-        x_full = _all_gather(x_shard, dim, group, ctx.world_size)
-        outs = [torch.matmul(x_full, w.t()) for w in weights]
+        if copy_engine is not None:
+            hidden = x_shard.shape[-1]
+            full_shape = _shape_with(x_shard, dim, x_shard.shape[dim] * ctx.world_size)
+            x_local = x_shard.contiguous().view(-1, hidden)
+            x_full_2d, outs_2d = copy_engine.all_gather_matmul(x_local,
+                                                               [_as_dtype(w.t(), x_local.dtype) for w in weights])
+            x_full = x_full_2d.view(full_shape)
+            outs = [out.view(*full_shape[:-1], out.shape[-1]) for out in outs_2d]
+        else:
+            x_full = _all_gather(x_shard, dim, group, ctx.world_size)
+            outs = [torch.matmul(x_full, w.t()) for w in weights]
         ctx.save_for_backward(x_shard, *weights)
         return (x_full, *outs)
 
@@ -174,6 +192,9 @@ class ColumnGroupFromSequenceShards(torch.autograd.Function):
         hidden = x_shard.shape[-1]
         x_local = x_shard.contiguous().view(-1, hidden)
         full_shape = _shape_with(x_shard, ctx.dim, x_shard.shape[ctx.dim] * ctx.world_size)
+        if ctx.copy_engine is not None:
+            return ColumnGroupFromSequenceShards._backward_copy_engine(ctx, x_local, x_shard.shape, weights,
+                                                                       grad_x_full, grad_outs)
         x_2d = x_local.new_empty((ctx.world_size * x_local.shape[0], hidden))
         gather = dist.all_gather_into_tensor(x_2d, x_local, group=ctx.group, async_op=True)
         # Sum of the input gradients of all the linears; addmm_ accumulates inside each GEMM.
@@ -201,7 +222,99 @@ class ColumnGroupFromSequenceShards(torch.autograd.Function):
             else:
                 grad_weights.append(torch.matmul(grad_out.reshape(-1, grad_out.shape[-1]).t(), x_2d))
         handle.wait()
-        return (grad_shard, None, None, *grad_weights)
+        return (grad_shard, None, None, None, None, *grad_weights)
+
+    @staticmethod
+    def _backward_copy_engine(ctx, x_local, shard_shape, weights, grad_x_full, grad_outs):
+        """The input gradient of each peer's rows is computed and copied to that peer while the next is computed;
+        the input is gathered again first, on the same copy stream."""
+        hidden = x_local.shape[-1]
+        x_full_2d = ctx.copy_engine.all_gather_start(x_local)
+        grads_2d = [None if g is None else g.reshape(-1, g.shape[-1]) for g in grad_outs]
+        grad_x_2d = None if grad_x_full is None else grad_x_full.reshape(-1, hidden)
+        dtype = next((g.dtype for g in grads_2d if g is not None), x_local.dtype)
+        weights = [_as_dtype(w, dtype) for w in weights]
+
+        def partial_into(rows, out):
+            first = True
+            for grad, weight in zip(grads_2d, weights):
+                if grad is None:
+                    continue
+                if first:
+                    torch.matmul(grad[rows], weight, out=out)
+                    first = False
+                else:
+                    out.addmm_(grad[rows], weight)
+            if first:
+                out.zero_()
+            if grad_x_2d is not None:
+                out.add_(grad_x_2d[rows])
+
+        rows_total = x_full_2d.shape[0]
+        pending = ctx.copy_engine.matmul_reduce_scatter_start(rows_total, hidden, dtype, x_local.device, partial_into)
+        ctx.copy_engine.all_gather_wait()
+        x_2d = _as_dtype(x_full_2d, dtype)
+        # Before the reduce-scatter's barrier, so that these GEMMs run while its copies finish.
+        grad_weights = [None if g is None else torch.matmul(g.t(), x_2d) for g in grads_2d]
+        grad_shard = ctx.copy_engine.matmul_reduce_scatter_finish(pending)
+        return (grad_shard.view(shard_shape), None, None, None, None, *grad_weights)
+
+
+class RowParallelToSequenceShards(torch.autograd.Function):
+    """Row-parallel linear whose summed output goes to the rank that holds those tokens, on the copy engines in the
+    forward pass, the backward pass or both (NCCL in the other).
+
+    Forward: the partial result for each peer's rows is copied to that peer while the next one is computed.
+    Backward: the output gradient is gathered while the input-gradient GEMM runs on the blocks already here.
+    """
+
+    @staticmethod
+    @autocast_custom_fwd
+    def forward(ctx, x, weight, group, dim, copy_engine, backward_copy_engine):
+        ctx.group, ctx.dim, ctx.copy_engine = group, dim, backward_copy_engine
+        ctx.world_size = world_size = dist.get_world_size(group=group)
+        _check_divisible(x, dim, world_size)
+        ctx.save_for_backward(x, weight)
+        if copy_engine is None:
+            return _reduce_scatter(torch.matmul(x, weight.t()), dim, group, world_size)
+        x_2d = x.contiguous().view(-1, x.shape[-1])
+        weight_t = _as_dtype(weight.t(), x_2d.dtype)
+
+        def partial_into(rows, out):
+            torch.matmul(x_2d[rows], weight_t, out=out)
+
+        out = copy_engine.matmul_reduce_scatter(x_2d.shape[0], weight.shape[0], x_2d.dtype, x.device, partial_into)
+        return out.view(*_shape_with(x, dim, x.shape[dim] // world_size)[:-1], weight.shape[0])
+
+    @staticmethod
+    @autocast_custom_bwd
+    def backward(ctx, grad_shard):
+        x, weight = ctx.saved_tensors
+        if ctx.copy_engine is None:
+            grad_full = _all_gather(grad_shard, ctx.dim, ctx.group, ctx.world_size)
+            grad_in = torch.matmul(grad_full, _as_dtype(weight, grad_full.dtype))
+            grad_full_2d = grad_full.reshape(-1, grad_full.shape[-1])
+            grad_weight = torch.matmul(grad_full_2d.t(), _as_dtype(x.reshape(-1, x.shape[-1]), grad_full.dtype))
+            return grad_in, grad_weight, None, None, None, None
+        grad_local = grad_shard.contiguous().view(-1, grad_shard.shape[-1])
+        grad_full, (grad_in, ) = ctx.copy_engine.all_gather_matmul(grad_local, [_as_dtype(weight, grad_local.dtype)])
+        grad_weight = torch.matmul(grad_full.t(), _as_dtype(x.reshape(-1, x.shape[-1]), grad_full.dtype))
+        return grad_in.view(x.shape), grad_weight, None, None, None, None
+
+
+def row_parallel_to_sequence_shards(x, weight, group, dim, ce_group):
+    """``x @ weight.t()`` summed over ``group`` into this rank's tokens, with the copy engines of ``ce_group`` in the
+    passes where they pay off and NCCL in the others."""
+    # The row output holds 1/tp of the input's tokens, at the full hidden size.
+    tokens_per_rank = x.numel() // x.shape[-1] // ce_group.world_size
+    hidden = weight.shape[0]
+    copy_engine = ce_group if copy_engine_pays_off(tokens_per_rank, hidden, ce_group.min_tokens) else None
+    backward_copy_engine = None
+    if copy_engine_pays_off(tokens_per_rank, hidden, ce_group.min_tokens, backward=True):
+        backward_copy_engine = ce_group
+    if copy_engine is None and backward_copy_engine is None:
+        return reduce_scatter_from_tensor_parallel_block(torch.matmul(x, weight.t()), group, dim)
+    return RowParallelToSequenceShards.apply(x, weight, group, dim, copy_engine, backward_copy_engine)
 
 
 class _BlockState:
@@ -258,16 +371,79 @@ def _layer_list_of(block_name):
     return None, None
 
 
-def apply_autotp_sequence_sharding(model, group, seq_dim=1, overlap=True, zero_stage=0):
+# With the automatic minimum, the copy engines are used when tokens per rank x hidden x hidden (the multiply-adds of
+# one [tokens, hidden] x [hidden, hidden] GEMM) is at least this. Below it, the GEMM on each peer's rows is too short
+# to hide the copies, events and barrier of the operation. On 8 x H200 the forward pass was slower than NCCL at 34.4e9
+# (Qwen3-8B, 2,048 tokens per rank) and 26.8e9 (Qwen3-32B, 1,024) and faster from 53.7e9; tokens x hidden alone does
+# not separate the cases. The backward pass has more GEMM work per collective and was faster from 34.4e9 (slower at
+# 17.2e9).
+COPY_ENGINE_MIN_MULTIPLY_ADDS = 45e9
+COPY_ENGINE_MIN_MULTIPLY_ADDS_BACKWARD = 25e9
+
+
+def copy_engine_pays_off(tokens, hidden, min_tokens, backward=False):
+    if min_tokens >= 0:
+        return tokens >= min_tokens
+    minimum = COPY_ENGINE_MIN_MULTIPLY_ADDS_BACKWARD if backward else COPY_ENGINE_MIN_MULTIPLY_ADDS
+    return tokens * hidden * hidden >= minimum
+
+
+def _copy_engine_for(x, ce_group, backward=False):
+    """``ce_group`` when this rank's part of ``x`` is large enough for the copy engines in the forward (or the
+    backward) pass, else None (the NCCL path)."""
+    if ce_group is None:
+        return None
+    tokens = x.numel() // x.shape[-1]
+    return ce_group if copy_engine_pays_off(tokens, x.shape[-1], ce_group.min_tokens, backward) else None
+
+
+def _make_copy_engine_group(group, min_tokens):
+    """A CopyEngineGroup for ``group``, or None when the copy engines cannot be used (the NCCL path)."""
+    from deepspeed.comm.copy_engine import CopyEngineGroup, copy_engine_available, group_within_one_node
+
+    if not copy_engine_available() or not group_within_one_node(group):
+        print_dist(
+            "AutoTP sequence sharding: copy-engine collectives need symmetric memory and a tensor-parallel "
+            "group within one node; using NCCL",
+            ranks=[0])
+        return None
+    ce_group = None
+    try:
+        ce_group = CopyEngineGroup(group)
+        ce_group.min_tokens = min_tokens
+        # A first allocation checks that the ranks can map each other's memory.
+        ce_group.gather_buffers.next(1, torch.bfloat16, torch.device(get_accelerator().current_device_name()))
+    except Exception as exc:  # noqa: BLE001 -- keep the NCCL collectives
+        print_dist(f"AutoTP sequence sharding: copy-engine collectives unavailable ({exc}); using NCCL", ranks=[0])
+        ce_group = None
+    # Every rank of the group must take the same path: agree on the copy engines only if all ranks have them.
+    usable = torch.tensor([1 if ce_group is not None else 0], device=get_accelerator().current_device_name())
+    dist.all_reduce(usable, op=dist.ReduceOp.MIN, group=group)
+    return ce_group if usable.item() == 1 else None
+
+
+def apply_autotp_sequence_sharding(model,
+                                   group,
+                                   seq_dim=1,
+                                   overlap=True,
+                                   copy_engine=False,
+                                   copy_engine_min_tokens=-1,
+                                   zero_stage=0):
     """Split the hidden states between AutoTP blocks along ``seq_dim`` over ``group``. Call after AutoTP has
     replaced the linears. ``overlap``: run the column-parallel linears that read a block input in one autograd node
-    and overlap their backward reduce-scatter (ColumnGroupFromSequenceShards). ``zero_stage``: the ZeRO stage, which
-    decides how the replicated parameters' gradients are summed. Returns the number of blocks."""
+    and overlap their backward reduce-scatter (ColumnGroupFromSequenceShards). ``copy_engine`` (with ``overlap``):
+    move the all-gathers and reduce-scatters of the blocks with the GPU copy engines, overlapped with the GEMMs
+    (deepspeed.comm.copy_engine), in the passes where this rank holds at least ``copy_engine_min_tokens`` tokens of
+    the micro-batch (negative: tokens x hidden x hidden at least COPY_ENGINE_MIN_MULTIPLY_ADDS forward and
+    COPY_ENGINE_MIN_MULTIPLY_ADDS_BACKWARD backward). ``zero_stage``: the ZeRO stage, which decides how the
+    replicated parameters' gradients are summed. Returns the number of blocks."""
     from deepspeed.module_inject.layers import (DS_TENSOR_MODEL_PARALLEL, LinearAllreduce, LinearLayer,
                                                 TensorParallel_Layer)
 
     if not pg_utils.is_parallel(group) or getattr(model, SEQUENCE_SHARDING_ATTR, False):
         return 0
+
+    ce_group = _make_copy_engine_group(group, copy_engine_min_tokens) if copy_engine and overlap else None
 
     row_layers = {name: m for name, m in model.named_modules() if isinstance(m, LinearAllreduce)}
     if not row_layers:
@@ -310,6 +486,7 @@ def apply_autotp_sequence_sharding(model, group, seq_dim=1, overlap=True, zero_s
             raise NotImplementedError(f"AutoTP sequence sharding does not support {type(m).__name__} ({name!r})")
         m.sequence_sharding = True
         m.sequence_sharding_dim = seq_dim
+        m.sequence_sharding_copy_engine = ce_group
 
     def make_gather_hook(state):
 
@@ -319,7 +496,10 @@ def apply_autotp_sequence_sharding(model, group, seq_dim=1, overlap=True, zero_s
             if overlap and state.learned_in is not None and state.passes[0] > state.learned_in and state.can_fuse():
                 readers = state.readers
                 weights = [layer.weight for layer in readers]
-                x_full, *outs = ColumnGroupFromSequenceShards.apply(x, group, seq_dim, *weights)
+                copy_engine = _copy_engine_for(x, ce_group)
+                backward_copy_engine = _copy_engine_for(x, ce_group, backward=True)
+                x_full, *outs = ColumnGroupFromSequenceShards.apply(x, group, seq_dim, copy_engine,
+                                                                    backward_copy_engine, *weights)
                 for layer, layer_out in zip(readers, outs):
                     layer._ds_sequence_sharding_pending = (state, x_full, layer_out)
                 return x_full
@@ -402,7 +582,9 @@ def apply_autotp_sequence_sharding(model, group, seq_dim=1, overlap=True, zero_s
     setattr(model, SEQUENCE_SHARDING_ATTR, True)
     print_dist(
         f"AutoTP sequence sharding: {len(blocks)} blocks in {len(layers)} layers of {list_name!r}, sequence dim "
-        f"{seq_dim}, overlap={overlap}; tensor-parallel gradient sum for {len(reduced)} replicated parameters"
+        f"{seq_dim}, overlap={overlap}, copy engine={ce_group is not None} (minimum tokens per rank: "
+        f"{copy_engine_min_tokens if copy_engine_min_tokens >= 0 else 'automatic'}); "
+        f"tensor-parallel gradient sum for {len(reduced)} replicated parameters"
         f"{', e.g. ' + repr(reduced[0]) if reduced else ''}",
         ranks=[0])
     return len(blocks)

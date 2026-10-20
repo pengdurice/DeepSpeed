@@ -3,6 +3,7 @@
 
 # DeepSpeed Team
 
+import contextlib
 import copy
 
 import pytest
@@ -39,7 +40,10 @@ def build_qwen3_model():
     return config, AutoModelForCausalLM.from_config(config)
 
 
-# plain: separate collectives; overlap: one autograd node per block with the backward reduce-scatter overlapped.
+# plain: separate collectives; overlap: one autograd node per block with the backward reduce-scatter overlapped;
+# copy-engine: the block all-gathers and reduce-scatters on the copy engines in both passes, for any size (the
+# automatic minimum would choose NCCL for this small model); copy-engine-backward: NCCL in the forward pass and the
+# copy engines in the backward pass (the per-pass automatic choice, forced here by setting its two minimums).
 MODES = {
     "plain": {
         "sequence_sharding_overlap": False
@@ -47,7 +51,53 @@ MODES = {
     "overlap": {
         "sequence_sharding_overlap": True
     },
+    "copy-engine": {
+        "sequence_sharding_overlap": True,
+        "sequence_sharding_copy_engine": True,
+        "sequence_sharding_copy_engine_min_tokens": 0
+    },
+    "copy-engine-backward": {
+        "sequence_sharding_overlap": True,
+        "sequence_sharding_copy_engine": True
+    },
 }
+
+
+@contextlib.contextmanager
+def copy_engine_minimums(mode):
+    """For copy-engine-backward: no size uses the copy engines forward, every size uses them backward."""
+    from deepspeed.module_inject import autotp_sequence_sharding as sharding
+    saved = sharding.COPY_ENGINE_MIN_MULTIPLY_ADDS, sharding.COPY_ENGINE_MIN_MULTIPLY_ADDS_BACKWARD
+    if mode == "copy-engine-backward":
+        sharding.COPY_ENGINE_MIN_MULTIPLY_ADDS, sharding.COPY_ENGINE_MIN_MULTIPLY_ADDS_BACKWARD = float("inf"), 0
+    try:
+        yield
+    finally:
+        sharding.COPY_ENGINE_MIN_MULTIPLY_ADDS, sharding.COPY_ENGINE_MIN_MULTIPLY_ADDS_BACKWARD = saved
+
+
+@contextlib.contextmanager
+def count_copy_engine_calls(counter):
+    """Count the calls of the copy-engine collectives into counter["calls"]."""
+    from deepspeed.comm.copy_engine import CopyEngineGroup
+    names = ("all_gather_matmul", "all_gather_start", "matmul_reduce_scatter_start")
+    saved = {name: getattr(CopyEngineGroup, name) for name in names}
+
+    def counted(method):
+
+        def wrapper(*args, **kwargs):
+            counter["calls"] += 1
+            return method(*args, **kwargs)
+
+        return wrapper
+
+    for name in names:
+        setattr(CopyEngineGroup, name, counted(saved[name]))
+    try:
+        yield
+    finally:
+        for name in names:
+            setattr(CopyEngineGroup, name, saved[name])
 
 
 def build_config(zero_stage, mode):
@@ -96,6 +146,11 @@ class TestAutoTPSequenceSharding(DistributedTest):
         decoder layer is recomputed in backward (the recomputation must save what the forward pass saved)."""
         skip_on_device()
         pytest.importorskip("transformers")
+        uses_copy_engine = MODES[mode].get("sequence_sharding_copy_engine", False)
+        if uses_copy_engine:
+            from deepspeed.comm.copy_engine import copy_engine_available
+            if not copy_engine_available():
+                pytest.skip("copy-engine collectives need PyTorch symmetric memory")
 
         config, model = build_qwen3_model()
         reference = copy.deepcopy(model).to(get_accelerator().current_device_name())
@@ -111,10 +166,14 @@ class TestAutoTPSequenceSharding(DistributedTest):
             lambda module, args, output: norm_lengths.append(args[0].shape[1]))
 
         # The first step learns which linears read each block input; later steps run them in one autograd node.
+        forward_calls, backward_calls = {"calls": 0}, {"calls": 0}
         for step in range(3):
             input_ids = tp_shared_input_ids(config.vocab_size, 16, step)
-            loss = engine(input_ids=input_ids, labels=input_ids).loss
-            engine.backward(loss)
+            with copy_engine_minimums(mode):
+                with count_copy_engine_calls(forward_calls):
+                    loss = engine(input_ids=input_ids, labels=input_ids).loss
+                with count_copy_engine_calls(backward_calls):
+                    engine.backward(loss)
             engine.step()
 
             reference_loss = reference(input_ids=input_ids, labels=input_ids).loss
@@ -126,6 +185,14 @@ class TestAutoTPSequenceSharding(DistributedTest):
 
         # Recomputation calls the norm again, so with checkpointing it runs more than once per step.
         assert len(norm_lengths) >= 3 and set(norm_lengths) == {16 // self.world_size}, norm_lengths
+        # The copy engines must actually run where the mode asks for them, not fall back to NCCL. A recomputation
+        # runs inside backward, so its calls count as backward calls.
+        if mode == "copy-engine":
+            assert forward_calls["calls"] > 0 and backward_calls["calls"] > 0
+        elif mode == "copy-engine-backward":
+            assert forward_calls["calls"] == 0 and backward_calls["calls"] > 0
+        else:
+            assert forward_calls["calls"] == 0 and backward_calls["calls"] == 0
         if zero_stage < 3:
             # The decoder norms see half of the sequence on each rank; their summed gradient keeps them equal to
             # the reference after the updates.

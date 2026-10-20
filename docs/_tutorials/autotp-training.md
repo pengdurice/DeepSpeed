@@ -201,6 +201,28 @@ Requirements, checked at `deepspeed.initialize()`:
 - No column-parallel layer gathers its output, and the DeepCompile `autotp` pass is
   not used.
 
+An NCCL all-gather or reduce-scatter runs as a kernel that takes SMs, so a GEMM
+running beside it slows down and little of the collective is hidden. With
+`sequence_sharding_copy_engine`, the block collectives move data with the GPU copy
+engines through PyTorch symmetric memory instead: each rank pulls its peers' blocks
+while the GEMMs run on the blocks already present, and pushes each peer's partial
+result while it computes the next one. This needs a tensor-parallel group within one
+node and PyTorch symmetric memory; otherwise NCCL is used and rank 0 logs why. At
+small sizes the copies cost more than they hide, so by default each pass uses the
+copy engines only when tokens per rank x hidden x hidden reaches 45e9 (forward) or
+25e9 (backward); `sequence_sharding_copy_engine_min_tokens` sets a token count
+instead. The copy-engine collectives set `TORCH_SYMM_MEM_DISABLE_MULTICAST=1` unless
+it is already set: they need no multicast, and multicast objects are also used by
+NCCL's NVLink SHARP collectives.
+
+```json
+"tensor_parallel": {
+    "autotp_size": 8,
+    "sequence_sharding": true,
+    "sequence_sharding_copy_engine": true
+}
+```
+
 The hidden states are gathered again after the last decoder layer, so the final
 norm, output layer and loss see the whole sequence. Combine with
 `vocab_parallel_lm_head` (below) to keep the output layer and loss sharded as well.
