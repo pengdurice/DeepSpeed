@@ -791,12 +791,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         if self.contiguous_gradients:
             for dtype, bucket in self.ipg_buckets.items():
-                # A bucket holds each parameter's gradient at most once before it is reduced, so a bucket
-                # for a few small parameters (for example ones kept in fp32) needs only their total size.
-                bucket_numel = sum(p.ds_numel for p in all_params if self.get_param_comm_dtype(p) == dtype)
-                bucket.buffer = torch.empty(min(self.reduce_bucket_size, max(bucket_numel, 1)),
-                                            dtype=dtype,
-                                            device=get_accelerator().current_device_name())
+                # A bucket of only parameters kept in fp32 needs only their total size. Other buckets keep
+                # reduce_bucket_size: a backward that raised leaves its gradients in the bucket until step(), so a
+                # retried backward adds those parameters again, and a bucket sized to the parameters would fill
+                # and reduce with a parameter in it twice.
+                bucket_params = [p for p in all_params if self.get_param_comm_dtype(p) == dtype]
+                bucket_numel = self.reduce_bucket_size
+                if bucket_params and all(self._is_kept_in_fp32(p) for p in bucket_params):
+                    bucket_numel = min(self.reduce_bucket_size, sum(p.ds_numel for p in bucket_params))
+                bucket.buffer = torch.empty(bucket_numel, dtype=dtype, device=get_accelerator().current_device_name())
 
         self.grad_partitions_flat_buffer = None
         self.__param_id_to_grad_partition: Dict[int, Tensor] = {}
